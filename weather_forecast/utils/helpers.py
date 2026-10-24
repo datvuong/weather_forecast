@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import date, datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
@@ -103,10 +104,21 @@ def get_project_root() -> Path:
 
 
 def get_data_dir() -> Path:
-    """Return the path to the data/ directory."""
+    """Return the path to the data/ directory.
+
+    Can be overridden with the WEATHER_FORECAST_DATA_DIR environment variable.
+    """
+    override = os.environ.get("WEATHER_FORECAST_DATA_DIR")
+    if override:
+        return Path(override)
     return get_project_root() / "data"
 
 
 def get_warehouse_dir() -> Path:
     """Return the path to the warehouse/ directory."""
     return get_project_root() / "warehouse"
+
+
+def utc_today() -> date:
+    """Return today's date in UTC — the timezone of the daily partitions."""
+    return datetime.now(timezone.utc).date()

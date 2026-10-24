@@ -22,6 +22,10 @@ MAX_RETRIES = 3
 BACKOFF_FACTOR = 1.0  # seconds: 1, 2, 4
 REQUEST_TIMEOUT = 30.0  # seconds
 
+# Request hourly timestamps in UTC so they line up with the UTC daily partitions.
+# Local time is derived per location in the Silver layer.
+API_TIMEZONE = "GMT"
+
 
 class OpenMeteoClient(ConfigurableResource):
     """Dagster resource for fetching weather data from Open-Meteo API.
@@ -92,6 +96,8 @@ class OpenMeteoClient(ConfigurableResource):
         temperature_unit: str = "celsius",
         wind_speed_unit: str = "kmh",
         precipitation_unit: str = "mm",
+        start_date: date | None = None,
+        end_date: date | None = None,
     ) -> dict:
         """Fetch forecast data for a single location.
 
@@ -99,10 +105,14 @@ class OpenMeteoClient(ConfigurableResource):
             latitude: WGS84 latitude.
             longitude: WGS84 longitude.
             hourly_variables: List of Open-Meteo variable names.
-            forecast_days: Number of forecast days (1-16).
+            forecast_days: Number of forecast days (1-16). Ignored when
+                start_date/end_date are given.
             temperature_unit: Temperature unit (celsius/fahrenheit).
             wind_speed_unit: Wind speed unit (kmh/ms/mph/kn).
             precipitation_unit: Precipitation unit (mm/inch).
+            start_date: Optional explicit start date (e.g. a recent past day
+                not yet available in the archive).
+            end_date: Optional explicit end date; required with start_date.
 
         Returns:
             Raw JSON response dict from the Open-Meteo forecast API.
@@ -111,12 +121,17 @@ class OpenMeteoClient(ConfigurableResource):
             "latitude": latitude,
             "longitude": longitude,
             "hourly": ",".join(hourly_variables),
-            "forecast_days": forecast_days,
             "temperature_unit": temperature_unit,
             "wind_speed_unit": wind_speed_unit,
             "precipitation_unit": precipitation_unit,
-            "timezone": "auto",
+            "timezone": API_TIMEZONE,
         }
+        # Open-Meteo treats forecast_days and start_date/end_date as mutually exclusive
+        if start_date is not None and end_date is not None:
+            params["start_date"] = start_date.isoformat()
+            params["end_date"] = end_date.isoformat()
+        else:
+            params["forecast_days"] = forecast_days
 
         logger.info(
             "Fetching forecast for (%.4f, %.4f) with %d variables",
@@ -169,7 +184,7 @@ class OpenMeteoClient(ConfigurableResource):
             "temperature_unit": temperature_unit,
             "wind_speed_unit": wind_speed_unit,
             "precipitation_unit": precipitation_unit,
-            "timezone": "auto",
+            "timezone": API_TIMEZONE,
         }
 
         logger.info(
