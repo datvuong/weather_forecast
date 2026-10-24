@@ -26,6 +26,8 @@ End-to-end weather forecast data pipeline using **Medallion Architecture** built
 
 ## Quick Start
 
+> New to the project? The **[User Guide](docs/user-guide.md)** walks through configuration, first run, backfill, schedules, checking results and troubleshooting.
+
 ```bash
 # Clone the repository
 git clone https://github.com/datvuong/weather_forecast.git
@@ -118,7 +120,7 @@ Open-Meteo API
 | `hourly_weather_schedule` | `weather_pipeline_job` | every hour at `:00` UTC | Bronze → Silver (hourly + daily) → Gold for **today's UTC partition**, refreshing the latest forecast |
 | `current_weather_schedule` | `current_weather_job` | every `current_interval_minutes` (default 15) | Snapshot of current conditions → Silver history → `gold_current_conditions` |
 
-Turn them on under **Overview → Schedules** in the Dagster UI (schedules start stopped).
+Turn them on from the schedules list in the Dagster UI (the **Automation** page; **Overview → Schedules** on older versions). Schedules start stopped.
 
 Partitions are **UTC calendar days**: in Adelaide (UTC+10:30) the `2026-10-24` partition covers
 10:30 on the 24th to 09:30 on the 25th, local time. Each hourly Silver row has both
@@ -187,6 +189,7 @@ relocate the data lake or config.
 
 ## Documentation
 
+- [User Guide](docs/user-guide.md) — Configure, run and test the pipeline locally
 - [Design Proposal](docs/design-proposal.md) — Architecture options and trade-offs
 - [Implementation Plan](docs/implementation-plan.md) — Detailed phased implementation plan
 - [AGENTS.md](AGENTS.md) — Contributor and agent onboarding guide

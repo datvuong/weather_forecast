@@ -16,6 +16,7 @@ env/
 # Dagster
 .dagster_home/
 dagster_home/
+.tmp_dagster_home_*/
 
 # Data (local data lake - not version controlled)
 data/bronze/
