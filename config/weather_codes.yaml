@@ -1,0 +1,286 @@
+# WMO weather interpretation codes (WW) as used by Open-Meteo
+# =============================================================
+# Seed for the dim_weather_code dimension table. Descriptions are copied
+# verbatim from Open-Meteo's published mapping:
+#   https://open-meteo.com/en/docs  ("WMO Weather interpretation codes")
+# The other attributes are this project's analytics classification and
+# can be edited (e.g. relabelled or translated) without code changes.
+#
+# Fields:
+#   code:               WMO code (matches weather_code in the Silver tables)
+#   description:        Open-Meteo's description
+#   condition_group:    clear | cloudy | fog | drizzle | rain | snow | showers | thunderstorm
+#   precipitation_type: none | drizzle | rain | snow | mixed | hail
+#                       (mixed = WMO "rain and/or snow", used for thunderstorms without hail)
+#   intensity:          none | slight | moderate | heavy | violent | unspecified
+#   is_precipitation:   true for any falling precipitation (drizzle and above)
+#   is_freezing:        freezing drizzle/rain and depositing rime fog
+#   is_thunderstorm:    codes 95-99
+#   severity_rank:      0 = least severe; follows the ascending code order
+#                       (WMO codes broadly increase with severity)
+#   note:               optional remark
+
+weather_codes:
+  - code: 0
+    description: "Clear sky"
+    condition_group: clear
+    precipitation_type: none
+    intensity: none
+    is_precipitation: false
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 0
+  - code: 1
+    description: "Mainly clear"
+    condition_group: clear
+    precipitation_type: none
+    intensity: none
+    is_precipitation: false
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 1
+  - code: 2
+    description: "Partly cloudy"
+    condition_group: cloudy
+    precipitation_type: none
+    intensity: none
+    is_precipitation: false
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 2
+  - code: 3
+    description: "Overcast"
+    condition_group: cloudy
+    precipitation_type: none
+    intensity: none
+    is_precipitation: false
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 3
+  - code: 45
+    description: "Fog"
+    condition_group: fog
+    precipitation_type: none
+    intensity: none
+    is_precipitation: false
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 4
+  - code: 48
+    description: "Depositing rime fog"
+    condition_group: fog
+    precipitation_type: none
+    intensity: none
+    is_precipitation: false
+    is_freezing: true
+    is_thunderstorm: false
+    severity_rank: 5
+  - code: 51
+    description: "Light drizzle"
+    condition_group: drizzle
+    precipitation_type: drizzle
+    intensity: slight
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 6
+  - code: 53
+    description: "Moderate drizzle"
+    condition_group: drizzle
+    precipitation_type: drizzle
+    intensity: moderate
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 7
+  - code: 55
+    description: "Dense drizzle"
+    condition_group: drizzle
+    precipitation_type: drizzle
+    intensity: heavy
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 8
+  - code: 56
+    description: "Light freezing drizzle"
+    condition_group: drizzle
+    precipitation_type: drizzle
+    intensity: slight
+    is_precipitation: true
+    is_freezing: true
+    is_thunderstorm: false
+    severity_rank: 9
+  - code: 57
+    description: "Dense freezing drizzle"
+    condition_group: drizzle
+    precipitation_type: drizzle
+    intensity: heavy
+    is_precipitation: true
+    is_freezing: true
+    is_thunderstorm: false
+    severity_rank: 10
+  - code: 61
+    description: "Slight rain"
+    condition_group: rain
+    precipitation_type: rain
+    intensity: slight
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 11
+  - code: 63
+    description: "Moderate rain"
+    condition_group: rain
+    precipitation_type: rain
+    intensity: moderate
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 12
+  - code: 65
+    description: "Heavy rain"
+    condition_group: rain
+    precipitation_type: rain
+    intensity: heavy
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 13
+  - code: 66
+    description: "Light freezing rain"
+    condition_group: rain
+    precipitation_type: rain
+    intensity: slight
+    is_precipitation: true
+    is_freezing: true
+    is_thunderstorm: false
+    severity_rank: 14
+  - code: 67
+    description: "Heavy freezing rain"
+    condition_group: rain
+    precipitation_type: rain
+    intensity: heavy
+    is_precipitation: true
+    is_freezing: true
+    is_thunderstorm: false
+    severity_rank: 15
+  - code: 71
+    description: "Slight snowfall"
+    condition_group: snow
+    precipitation_type: snow
+    intensity: slight
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 16
+  - code: 73
+    description: "Moderate snowfall"
+    condition_group: snow
+    precipitation_type: snow
+    intensity: moderate
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 17
+  - code: 75
+    description: "Heavy snowfall"
+    condition_group: snow
+    precipitation_type: snow
+    intensity: heavy
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 18
+  - code: 77
+    description: "Snow grains"
+    condition_group: snow
+    precipitation_type: snow
+    intensity: unspecified
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 19
+  - code: 80
+    description: "Slight rain showers"
+    condition_group: showers
+    precipitation_type: rain
+    intensity: slight
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 20
+  - code: 81
+    description: "Moderate rain showers"
+    condition_group: showers
+    precipitation_type: rain
+    intensity: moderate
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 21
+  - code: 82
+    description: "Violent rain showers"
+    condition_group: showers
+    precipitation_type: rain
+    intensity: violent
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 22
+  - code: 85
+    description: "Slight snow showers"
+    condition_group: showers
+    precipitation_type: snow
+    intensity: slight
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 23
+  - code: 86
+    description: "Heavy snow showers"
+    condition_group: showers
+    precipitation_type: snow
+    intensity: heavy
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 24
+  - code: 95
+    description: "Thunderstorm"
+    condition_group: thunderstorm
+    precipitation_type: mixed
+    intensity: moderate
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: true
+    severity_rank: 25
+  - code: 96
+    description: "Thunderstorm with slight hail"
+    condition_group: thunderstorm
+    precipitation_type: hail
+    intensity: slight
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: true
+    severity_rank: 26
+    note: "Only reported by models with explicit hail forecasts (e.g. DWD ICON, UKMO); others report 95/97"
+  - code: 97
+    description: "Heavy thunderstorm"
+    condition_group: thunderstorm
+    precipitation_type: mixed
+    intensity: heavy
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: true
+    severity_rank: 27
+  - code: 99
+    description: "Thunderstorm with heavy hail"
+    condition_group: thunderstorm
+    precipitation_type: hail
+    intensity: heavy
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: true
+    severity_rank: 28
+    note: "Only reported by models with explicit hail forecasts (e.g. DWD ICON, UKMO); others report 95/97"

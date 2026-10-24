@@ -15,6 +15,7 @@ from weather_forecast.utils.helpers import (
     get_project_root,
     load_locations_config,
     load_variables_config,
+    load_weather_codes,
     utc_today,
 )
 
@@ -251,29 +252,35 @@ def ingestion_ts() -> datetime:
     return datetime(2026, 10, 24, 1, 0, tzinfo=timezone.utc)
 
 
+def _clear_config_caches():
+    load_variables_config.cache_clear()
+    load_locations_config.cache_clear()
+    load_weather_codes.cache_clear()
+
+
 @pytest.fixture
 def variables_config(tmp_path, monkeypatch):
     """Factory pointing the config loaders at a temp variables.yaml.
 
     Call it with section overrides, e.g. variables_config(hourly_variables=[...]);
     unspecified sections/settings come from the project's config. Returns the
-    loaded VariablesConfig. The project's locations.yaml is reused.
+    loaded VariablesConfig. The project's locations.yaml and weather_codes.yaml
+    are reused.
     """
     project_config = get_project_root() / "config"
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     shutil.copy(project_config / "locations.yaml", config_dir)
+    shutil.copy(project_config / "weather_codes.yaml", config_dir)
     monkeypatch.setenv("WEATHER_FORECAST_CONFIG_DIR", str(config_dir))
 
     def write(**overrides):
         raw = yaml.safe_load((project_config / "variables.yaml").read_text())
         raw.update(overrides)
         (config_dir / "variables.yaml").write_text(yaml.safe_dump(raw, allow_unicode=True))
-        load_variables_config.cache_clear()
-        load_locations_config.cache_clear()
+        _clear_config_caches()
         return load_variables_config()
 
     write()  # start from the project's config so the loaders work immediately
     yield write
-    load_variables_config.cache_clear()
-    load_locations_config.cache_clear()
+    _clear_config_caches()

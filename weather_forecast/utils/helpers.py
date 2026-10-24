@@ -14,6 +14,7 @@ from weather_forecast.models.weather import (
     LocationConfig,
     LocationsConfig,
     VariablesConfig,
+    WeatherCodesConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,21 @@ def load_variables_config(config_path: str | Path | None = None) -> VariablesCon
     raw = load_yaml(config_path)
 
     return VariablesConfig.model_validate(raw)
+
+
+@lru_cache(maxsize=1)
+def load_weather_codes(config_path: str | Path | None = None) -> WeatherCodesConfig:
+    """Load and validate the WMO weather code seed (config/weather_codes.yaml).
+
+    Args:
+        config_path: Optional explicit path. If None, uses the default config dir.
+
+    Returns:
+        Validated WeatherCodesConfig object.
+    """
+    if config_path is None:
+        config_path = _get_config_dir() / "weather_codes.yaml"
+    return WeatherCodesConfig.model_validate(load_yaml(config_path))
 
 
 def get_variable_names(config_path: str | Path | None = None) -> list[str]:

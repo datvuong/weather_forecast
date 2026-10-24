@@ -15,6 +15,12 @@ from weather_forecast.assets.current import (
     silver_current_check,
     silver_current_weather,
 )
+from weather_forecast.assets.dimensions import (
+    current_weather_code_check,
+    daily_weather_code_check,
+    dim_weather_code,
+    hourly_weather_code_check,
+)
 from weather_forecast.assets.gold import (
     gold_daily_precipitation,
     gold_daily_temperature,
@@ -55,6 +61,7 @@ defs = dg.Definitions(
         bronze_current,
         silver_current_weather,
         gold_current_conditions,
+        dim_weather_code,
     ],
     asset_checks=[
         bronze_file_exists_check,
@@ -63,6 +70,9 @@ defs = dg.Definitions(
         gold_temperature_check,
         silver_current_check,
         gold_current_freshness_check,
+        hourly_weather_code_check,
+        daily_weather_code_check,
+        current_weather_code_check,
     ],
     jobs=[weather_pipeline_job, current_weather_job],
     schedules=[hourly_weather_schedule, current_weather_schedule],

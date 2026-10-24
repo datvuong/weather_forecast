@@ -60,6 +60,7 @@ def test_definitions_load():
         "gold_current_conditions",
         "gold_daily_temperature",
         "gold_daily_precipitation",
+        "dim_weather_code",
     }
     assert defs.resolve_job_def("weather_pipeline_job").partitions_def == daily_partitions
 

@@ -260,6 +260,43 @@ class LocationsConfig(BaseModel):
         return self
 
 
+class WeatherCodeDefinition(BaseModel):
+    """One WMO weather interpretation code, parsed from config/weather_codes.yaml."""
+
+    code: int = Field(..., ge=0, le=99, description="WMO code (matches weather_code columns)")
+    description: str
+    condition_group: Literal[
+        "clear", "cloudy", "fog", "drizzle", "rain", "snow", "showers", "thunderstorm"
+    ]
+    precipitation_type: Literal["none", "drizzle", "rain", "snow", "mixed", "hail"]
+    intensity: Literal["none", "slight", "moderate", "heavy", "violent", "unspecified"]
+    is_precipitation: bool
+    is_freezing: bool
+    is_thunderstorm: bool
+    severity_rank: int = Field(..., ge=0)
+    note: Optional[str] = None
+
+
+class WeatherCodesConfig(BaseModel):
+    """Full weather codes seed file (config/weather_codes.yaml)."""
+
+    weather_codes: list[WeatherCodeDefinition] = Field(..., min_length=1)
+
+    @model_validator(mode="after")
+    def validate_unique(self) -> "WeatherCodesConfig":
+        """Codes and severity ranks must be unique."""
+        for field in ("code", "severity_rank"):
+            values = [getattr(c, field) for c in self.weather_codes]
+            duplicates = sorted({v for v in values if values.count(v) > 1})
+            if duplicates:
+                raise ValueError(f"duplicate weather code {field}s: {duplicates}")
+        return self
+
+    @property
+    def codes(self) -> set[int]:
+        return {c.code for c in self.weather_codes}
+
+
 # ---------------------------------------------------------------------------
 # Domain models (cleaned data)
 # ---------------------------------------------------------------------------
