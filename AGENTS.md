@@ -19,7 +19,7 @@ This is an **end-to-end weather forecast data pipeline** using **Medallion Archi
 | Layer | Purpose | Storage |
 |---|---|---|
 | **Bronze** | Raw API responses preserved as-is | `data/bronze/{location}/{date}.parquet` |
-| **Silver** | Cleaned, typed, deduplicated hourly records | `data/silver/{date}.parquet` |
+| **Silver** | Cleaned, typed, deduplicated hourly/daily records (columns from config) | `data/silver/{hourly,daily}/{date}.parquet` |
 | **Gold** | Aggregated daily summaries for analytics | `data/gold/{metric}/{date}.parquet` + `warehouse/weather.duckdb` |
 
 ## Project Structure

@@ -8,10 +8,10 @@ from pydantic import ValidationError
 from weather_forecast.models.weather import (
     APISettings,
     BronzeRecord,
-    HourlyWeatherRecord,
     LocationConfig,
     VariableDefinition,
     VariablesConfig,
+    build_record_model,
 )
 from weather_forecast.utils.helpers import (
     get_data_dir,
@@ -142,25 +142,57 @@ class TestVariablesConfig:
             )
 
 
-class TestHourlyWeatherRecord:
+HourlyRecord = build_record_model(
+    "hourly", {"temperature_2m": False, "relative_humidity_2m": False, "uv_index": False}
+)
+
+
+class TestBuildRecordModel:
     def test_weather_fields_default_to_none(self):
-        rec = HourlyWeatherRecord(**_record())
+        rec = HourlyRecord(**_record())
         assert rec.temperature_2m is None
         assert rec.uv_index is None
 
     def test_numeric_coercion(self):
-        rec = HourlyWeatherRecord(**_record(temperature_2m="21.5", relative_humidity_2m=60))
+        rec = HourlyRecord(**_record(temperature_2m="21.5", relative_humidity_2m=60))
         assert rec.temperature_2m == 21.5
         assert isinstance(rec.relative_humidity_2m, float)
 
     def test_non_numeric_value_rejected(self):
         with pytest.raises(ValidationError):
-            HourlyWeatherRecord(**_record(temperature_2m="hot"))
+            HourlyRecord(**_record(temperature_2m="hot"))
 
     @pytest.mark.parametrize("bad", ["2026/10/21", "21-10-2026", "2026-13-01", ""])
     def test_invalid_partition_date(self, bad):
         with pytest.raises(ValidationError):
-            HourlyWeatherRecord(**_record(partition_date=bad))
+            HourlyRecord(**_record(partition_date=bad))
+
+    def test_missing_key_rejected(self):
+        record = _record()
+        del record["timestamp_utc"]
+        with pytest.raises(ValidationError):
+            HourlyRecord(**record)
+
+    def test_fields_follow_config(self):
+        model = build_record_model("hourly", {"cloud_cover": False})
+        assert "cloud_cover" in model.model_fields
+        assert "temperature_2m" not in model.model_fields
+
+    def test_time_valued_variable_parses_epoch(self):
+        model = build_record_model("daily", {"sunrise": True, "precipitation_sum": False})
+        rec = model(
+            location_name="Adelaide",
+            latitude=-34.9,
+            longitude=138.6,
+            date_local="2026-10-21",
+            sunrise=1792439864,
+            precipitation_sum=3,
+            partition_date="2026-10-21",
+            ingestion_timestamp=datetime(2026, 10, 24, tzinfo=timezone.utc),
+        )
+        # 06:27:44 local (UTC+10:30) on the 20th
+        assert rec.sunrise == datetime(2026, 10, 19, 19, 57, 44, tzinfo=timezone.utc)
+        assert rec.precipitation_sum == 3.0
 
 
 class TestBronzeRecord:

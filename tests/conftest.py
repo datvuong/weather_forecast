@@ -1,15 +1,22 @@
 """Shared pytest fixtures: temp data directories, sample API responses, fake clients."""
 
+import shutil
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import yaml
 
 from weather_forecast.resources.api_client import OpenMeteoRequest
 from weather_forecast.resources.duckdb_resource import DuckDBResource
-from weather_forecast.utils.helpers import load_locations_config, utc_today
+from weather_forecast.utils.helpers import (
+    get_project_root,
+    load_locations_config,
+    load_variables_config,
+    utc_today,
+)
 
 VARIABLES = [
     "temperature_2m",
@@ -83,6 +90,7 @@ def make_api_response(
             "precipitation_sum": lambda d, m: 3.0,
             "precipitation_probability_max": lambda d, m: 80.0,
             "uv_index_max": lambda d, m: 7.0,
+            "wind_speed_10m_max": lambda d, m: 25.0,
             "sunrise": lambda d, m: int((m + timedelta(hours=6, minutes=30)).timestamp()),
             "sunset": lambda d, m: int((m + timedelta(hours=19, minutes=30)).timestamp()),
         }
@@ -175,3 +183,30 @@ def past_date() -> date:
 @pytest.fixture
 def ingestion_ts() -> datetime:
     return datetime(2026, 10, 24, 1, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+def variables_config(tmp_path, monkeypatch):
+    """Factory pointing the config loaders at a temp variables.yaml.
+
+    Call it with section overrides, e.g. variables_config(hourly_variables=[...]);
+    unspecified sections/settings come from the project's config. Returns the
+    loaded VariablesConfig. The project's locations.yaml is reused.
+    """
+    project_config = get_project_root() / "config"
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    shutil.copy(project_config / "locations.yaml", config_dir)
+    monkeypatch.setenv("WEATHER_FORECAST_CONFIG_DIR", str(config_dir))
+
+    def write(**overrides):
+        raw = yaml.safe_load((project_config / "variables.yaml").read_text())
+        raw.update(overrides)
+        (config_dir / "variables.yaml").write_text(yaml.safe_dump(raw, allow_unicode=True))
+        load_variables_config.cache_clear()
+        load_locations_config.cache_clear()
+        return load_variables_config()
+
+    yield write
+    load_variables_config.cache_clear()
+    load_locations_config.cache_clear()

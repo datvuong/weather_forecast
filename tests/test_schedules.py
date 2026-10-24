@@ -43,6 +43,7 @@ def test_definitions_load():
     assert asset_keys == {
         "bronze_forecast",
         "silver_hourly_weather",
+        "silver_daily_weather",
         "gold_daily_temperature",
         "gold_daily_precipitation",
     }

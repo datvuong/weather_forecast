@@ -20,10 +20,14 @@ from weather_forecast.models.weather import (
 def _get_config_dir() -> Path:
     """Return the path to the config/ directory.
 
-    Looks for config/ relative to the project root. The project root is
-    determined by walking up from this file's location until we find
+    Can be overridden with the WEATHER_FORECAST_CONFIG_DIR environment variable.
+    Otherwise looks for config/ relative to the project root. The project root
+    is determined by walking up from this file's location until we find
     pyproject.toml, or falls back to CWD.
     """
+    override = os.environ.get("WEATHER_FORECAST_CONFIG_DIR")
+    if override:
+        return Path(override)
     # Walk up from this file to find the project root
     current = Path(__file__).resolve().parent
     for _ in range(5):  # max 5 levels up

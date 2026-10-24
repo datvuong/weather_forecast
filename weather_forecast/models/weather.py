@@ -3,15 +3,15 @@
 Defines strict schemas for:
 - Configuration (locations, variables, API settings)
 - API responses (raw Open-Meteo JSON structure)
-- Domain models (cleaned hourly weather records)
+- Domain models (Silver records, built per config section at runtime)
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, create_model, field_validator, model_validator
 
 # Query parameters the pipeline sets itself; they can't be overridden via extra_params
 RESERVED_API_PARAMS = frozenset(
@@ -199,28 +199,44 @@ class LocationsConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class HourlyWeatherRecord(BaseModel):
-    """A single hourly weather observation — used in the Silver layer.
+Section = Literal["hourly", "daily", "current"]
 
-    All weather measurement fields are Optional because:
-    - Some variables may not be available (e.g., precipitation_probability
-      is forecast-only and null for historical data).
+# Key columns of each Silver table, in output order (variables follow, then metadata)
+SILVER_KEY_FIELDS: dict[str, dict[str, type]] = {
+    "hourly": {
+        "location_name": str,
+        "latitude": float,
+        "longitude": float,
+        "timestamp_utc": datetime,
+        "timestamp_local": datetime,
+    },
+    "daily": {
+        "location_name": str,
+        "latitude": float,
+        "longitude": float,
+        "date_local": date,
+    },
+    "current": {
+        "location_name": str,
+        "latitude": float,
+        "longitude": float,
+        "observed_at_utc": datetime,
+        "observed_at_local": datetime,
+        "interval_seconds": int,
+    },
+}
+SILVER_METADATA_FIELDS: dict[str, type] = {"partition_date": str, "ingestion_timestamp": datetime}
+
+
+class SilverRecord(BaseModel):
+    """Base for Silver records; variable fields are added per config at runtime.
+
+    All weather variable fields are Optional because:
+    - Some variables may not be available on an endpoint (e.g.
+      precipitation_probability is forecast-only and null for historical data).
     - Some values are legitimately null (e.g., UV index at night).
     """
 
-    location_name: str
-    latitude: float
-    longitude: float
-    timestamp_utc: datetime
-    timestamp_local: datetime
-    temperature_2m: Optional[float] = None
-    relative_humidity_2m: Optional[float] = None
-    precipitation: Optional[float] = None
-    precipitation_probability: Optional[float] = None
-    wind_speed_10m: Optional[float] = None
-    wind_direction_10m: Optional[float] = None
-    wind_gusts_10m: Optional[float] = None
-    uv_index: Optional[float] = None
     partition_date: str
     ingestion_timestamp: datetime
 
@@ -233,6 +249,24 @@ class HourlyWeatherRecord(BaseModel):
         except ValueError:
             raise ValueError(f"partition_date must be YYYY-MM-DD format, got: {v}")
         return v
+
+
+def build_record_model(section: Section, variables: dict[str, bool]) -> type[SilverRecord]:
+    """Build the Pydantic model validating one Silver record of a section.
+
+    Args:
+        section: "hourly", "daily" or "current" (selects the key columns).
+        variables: Configured variable names mapped to True for time-valued
+            variables (e.g. sunrise) and False for numeric ones.
+
+    Returns:
+        A SilverRecord subclass with required key fields and Optional
+        variable fields (datetime for time-valued, float otherwise).
+    """
+    fields: dict = {name: (type_, ...) for name, type_ in SILVER_KEY_FIELDS[section].items()}
+    for name, is_time in variables.items():
+        fields[name] = (Optional[datetime] if is_time else Optional[float], None)
+    return create_model(f"{section.title()}WeatherRecord", __base__=SilverRecord, **fields)
 
 
 # ---------------------------------------------------------------------------

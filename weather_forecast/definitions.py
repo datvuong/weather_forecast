@@ -13,7 +13,12 @@ from weather_forecast.assets.gold import (
     gold_daily_temperature,
     gold_temperature_check,
 )
-from weather_forecast.assets.silver import silver_hourly_weather, silver_quality_check
+from weather_forecast.assets.silver import (
+    silver_daily_check,
+    silver_daily_weather,
+    silver_hourly_weather,
+    silver_quality_check,
+)
 from weather_forecast.resources.api_client import OpenMeteoClient
 from weather_forecast.resources.duckdb_resource import DuckDBResource
 from weather_forecast.schedules import hourly_weather_schedule, weather_pipeline_job
@@ -23,12 +28,14 @@ defs = dg.Definitions(
     assets=[
         bronze_forecast,
         silver_hourly_weather,
+        silver_daily_weather,
         gold_daily_temperature,
         gold_daily_precipitation,
     ],
     asset_checks=[
         bronze_file_exists_check,
         silver_quality_check,
+        silver_daily_check,
         gold_temperature_check,
     ],
     jobs=[weather_pipeline_job],

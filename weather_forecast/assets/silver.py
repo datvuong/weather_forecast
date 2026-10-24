@@ -1,17 +1,23 @@
-"""Silver layer asset — cleaned, typed, validated hourly weather records.
+"""Silver layer assets — cleaned, typed, validated weather records.
 
-Reads raw Bronze Parquet files, parses the JSON responses, explodes
-hourly arrays into individual records, validates with Pydantic, and
-writes clean Parquet files.
+Reads raw Bronze Parquet files, parses the JSON responses, explodes each
+request section into individual records, validates them with Pydantic models
+built from config, and writes clean Parquet files.
 
-File layout:
-    data/silver/{partition_date}.parquet
-    (one file per date, containing all locations)
+The schema is wide and config-driven: every variable configured for a
+section in config/variables.yaml becomes a column, with no code changes.
+Time-valued variables (e.g. sunrise) are UTC timestamps; everything else is
+float64. Variables an endpoint doesn't provide are kept as null columns.
+
+File layout (one file per partition date, containing all locations):
+    data/silver/hourly/{partition_date}.parquet
+    data/silver/daily/{partition_date}.parquet
 """
 
 import json
 import logging
-from datetime import datetime
+from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -26,225 +32,247 @@ from dagster import (
 )
 
 from weather_forecast.assets.bronze import bronze_forecast
-from weather_forecast.models.weather import HourlyWeatherRecord
+from weather_forecast.models.weather import (
+    SILVER_KEY_FIELDS,
+    SILVER_METADATA_FIELDS,
+    LocationConfig,
+    Section,
+    VariableDefinition,
+    build_record_model,
+)
 from weather_forecast.partitions import daily_partitions
-from weather_forecast.utils.helpers import epoch_to_utc, get_data_dir, load_locations_config
+from weather_forecast.resources.api_client import unsupported_variables
+from weather_forecast.utils.helpers import (
+    epoch_to_local_date,
+    epoch_to_utc,
+    get_data_dir,
+    load_locations_config,
+    load_variables_config,
+)
 
 logger = logging.getLogger(__name__)
 
-# Weather variable columns that appear in Silver Parquet
-WEATHER_COLUMNS = [
-    "temperature_2m",
-    "relative_humidity_2m",
-    "precipitation",
-    "precipitation_probability",
-    "wind_speed_10m",
-    "wind_direction_10m",
-    "wind_gusts_10m",
-    "uv_index",
-]
+# Units marking a time-valued variable (Open-Meteo response or config)
+TIME_UNITS = frozenset({"unixtime", "iso8601"})
 
-# Valid ranges for data quality checks
-VALUE_RANGES = {
-    "temperature_2m": (-60.0, 65.0),
-    "relative_humidity_2m": (0.0, 100.0),
-    "precipitation": (0.0, 500.0),
-    "precipitation_probability": (0.0, 100.0),
-    "wind_speed_10m": (0.0, 400.0),
-    "wind_direction_10m": (0.0, 360.0),
-    "wind_gusts_10m": (0.0, 500.0),
-    "uv_index": (0.0, 20.0),
+# Columns identifying one record per section (deduplication keys)
+SECTION_KEYS: dict[str, list[str]] = {
+    "hourly": ["location_name", "timestamp_utc"],
+    "daily": ["location_name", "date_local"],
+    "current": ["location_name", "observed_at_utc"],
 }
 
-SILVER_COLUMNS = [
-    "location_name",
-    "latitude",
-    "longitude",
-    "timestamp_utc",
-    "timestamp_local",
-    *WEATHER_COLUMNS,
-    "partition_date",
-    "ingestion_timestamp",
-]
+# A raw API response with its location and Bronze ingestion time
+BronzeRow = tuple[LocationConfig, dict[str, Any], datetime]
 
 
-def _parse_hourly_data(
+def silver_path(section: Section, partition_date: str) -> Path:
+    """Return the Silver Parquet path of a section for a partition date."""
+    return get_data_dir() / "silver" / section / f"{partition_date}.parquet"
+
+
+def section_columns(section: Section, variables: list[str]) -> list[str]:
+    """Return the Silver column order: keys, configured variables, metadata."""
+    return [*SILVER_KEY_FIELDS[section], *variables, *SILVER_METADATA_FIELDS]
+
+
+def time_variables(
+    definitions: list[VariableDefinition], responses: list[dict[str, Any]], section: Section
+) -> set[str]:
+    """Return the time-valued variables of a section.
+
+    A variable is time-valued if its configured unit or any response's unit
+    is iso8601/unixtime (e.g. sunrise, sunset).
+    """
+    names = {d.name for d in definitions if d.unit in TIME_UNITS}
+    for raw in responses:
+        units = raw.get(f"{section}_units") or {}
+        names |= {n for n, unit in units.items() if unit in TIME_UNITS and n != "time"}
+    return names & {d.name for d in definitions}
+
+
+def _section_keys(
+    section: Section, epoch: int, tz: ZoneInfo, partition_date: date, data: dict, index: int
+) -> dict[str, Any] | None:
+    """Return the key columns of one row, or None if it's outside the partition."""
+    if section == "hourly":
+        ts_utc = epoch_to_utc(epoch)
+        if ts_utc.date() != partition_date:
+            return None
+        return {
+            "timestamp_utc": ts_utc,
+            "timestamp_local": ts_utc.astimezone(tz).replace(tzinfo=None),
+        }
+    if section == "daily":
+        local_date = epoch_to_local_date(epoch, tz.key)
+        if local_date != partition_date:
+            return None
+        return {"date_local": local_date}
+    # current: one snapshot per response
+    observed = epoch_to_utc(epoch)
+    if observed.date() != partition_date:
+        return None
+    return {
+        "observed_at_utc": observed,
+        "observed_at_local": observed.astimezone(tz).replace(tzinfo=None),
+        "interval_seconds": data.get("interval", [None])[index],
+    }
+
+
+def parse_section(
     raw_json: dict[str, Any],
-    location_name: str,
-    latitude: float,
-    longitude: float,
-    local_timezone: str,
-    partition_date: str,
+    section: Section,
+    variables: list[str],
+    time_vars: set[str],
+    location: LocationConfig,
+    partition_date: date,
     ingestion_ts: datetime,
 ) -> list[dict[str, Any]]:
-    """Parse Open-Meteo hourly JSON response into flat records.
+    """Parse one section of an Open-Meteo response into flat records.
 
-    Bronze requests unixtime timestamps, so hourly times are exact UTC epochs.
-    They are filtered against the UTC partition date and converted to the
-    location's local time for timestamp_local.
+    Bronze requests unixtime timestamps, so times are exact UTC epochs:
+    hourly rows are kept if their UTC date is the partition date, daily rows
+    if their local date is, and current snapshots if observed (UTC) that day.
 
     Args:
         raw_json: Parsed API response JSON.
-        location_name: City name.
-        latitude: Location latitude.
-        longitude: Location longitude.
-        local_timezone: IANA timezone of the location.
-        partition_date: The partition date string (YYYY-MM-DD, UTC).
+        section: "hourly", "daily" or "current".
+        variables: Configured variable names for the section (become columns).
+        time_vars: The subset of variables holding timestamps.
+        location: The location the response belongs to.
+        partition_date: The partition date (UTC day).
         ingestion_ts: When the data was ingested (from Bronze).
 
     Returns:
-        List of dicts, one per hourly observation.
+        List of dicts, one per record; missing variables are None.
     """
-    hourly = raw_json.get("hourly", {})
-    timestamps = hourly.get("time", [])
-
+    data = raw_json.get(section) or {}
+    if section == "current" and data:
+        # A current snapshot is a dict of scalars; treat it as a single row
+        data = {key: [value] for key, value in data.items()}
+    timestamps = data.get("time", [])
     if not timestamps:
         return []
 
-    time_format = raw_json.get("hourly_units", {}).get("time")
+    time_format = (raw_json.get(f"{section}_units") or {}).get("time")
     if time_format != "unixtime":
-        raise ValueError(f"Expected unixtime hourly timestamps from API, got {time_format!r}")
-    tz = ZoneInfo(local_timezone)
+        raise ValueError(f"Expected unixtime {section} timestamps from API, got {time_format!r}")
+    tz = ZoneInfo(location.timezone)
 
     records = []
     for i, epoch in enumerate(timestamps):
-        ts_utc = epoch_to_utc(epoch)
-        # Only include records that belong to this (UTC) partition date
-        if ts_utc.date().isoformat() != partition_date:
+        keys = _section_keys(section, epoch, tz, partition_date, data, i)
+        if keys is None:
             continue
 
         record = {
-            "location_name": location_name,
-            "latitude": latitude,
-            "longitude": longitude,
-            "timestamp_utc": ts_utc,
-            "timestamp_local": ts_utc.astimezone(tz).replace(tzinfo=None),
-            "partition_date": partition_date,
+            "location_name": location.name,
+            "latitude": raw_json.get("latitude", location.latitude),
+            "longitude": raw_json.get("longitude", location.longitude),
+            **keys,
+            "partition_date": partition_date.isoformat(),
             "ingestion_timestamp": ingestion_ts,
         }
-
-        # Extract each weather variable
-        for var in WEATHER_COLUMNS:
-            values = hourly.get(var, [])
-            record[var] = values[i] if i < len(values) else None
+        for var in variables:
+            values = data.get(var, [])
+            value = values[i] if i < len(values) else None
+            if var in time_vars and isinstance(value, (int, float)):
+                value = epoch_to_utc(value)
+            record[var] = value
 
         records.append(record)
 
     return records
 
 
-@asset(
-    partitions_def=daily_partitions,
-    group_name="silver",
-    compute_kind="python",
-    deps=[bronze_forecast],
-    description="Cleaned, typed, and validated hourly weather records.",
-)
-def silver_hourly_weather(
+def to_silver_frame(
+    section: Section, records: list[dict[str, Any]], variables: list[str], time_vars: set[str]
+) -> pd.DataFrame:
+    """Build a typed Silver DataFrame (also for zero records)."""
+    df = pd.DataFrame(records, columns=section_columns(section, variables))
+    for col in ("timestamp_utc", "observed_at_utc", "ingestion_timestamp"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], utc=True)
+    for col in ("timestamp_local", "observed_at_local"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col])
+    for col in ("latitude", "longitude"):
+        df[col] = df[col].astype("float64")
+    if "interval_seconds" in df.columns:
+        df["interval_seconds"] = df["interval_seconds"].astype("Int64")
+    for var in variables:
+        if var in time_vars:
+            df[var] = pd.to_datetime(df[var], utc=True)
+        else:
+            df[var] = df[var].astype("float64")
+    return df
+
+
+def build_silver_section(
     context: AssetExecutionContext,
-) -> None:
-    """Parse, clean, validate, and deduplicate Bronze data into Silver records.
+    section: Section,
+    bronze_rows: list[BronzeRow],
+    output_path: Path,
+) -> pd.DataFrame:
+    """Parse, validate, deduplicate and write one Silver section for a partition.
 
     Steps:
-    1. Read Bronze Parquet files for all locations on this partition date
-    2. Parse raw JSON → extract hourly arrays
-    3. Explode into individual hourly records
-    4. Filter records to only this partition date
-    5. Validate each record with Pydantic
-    6. Deduplicate on (location_name, timestamp_utc)
-    7. Write clean Parquet to Silver layer
+    1. Parse each raw response's section into records for this partition
+    2. Validate each record with a Pydantic model built from config
+    3. Deduplicate on the section keys, keeping the latest ingestion
+    4. Write clean Parquet and report metadata (null %, unsupported variables)
     """
     partition_date_str = context.partition_key
-    locations = load_locations_config()
-    data_dir = get_data_dir()
-    bronze_dir = data_dir / "bronze"
-    silver_dir = data_dir / "silver"
-    silver_dir.mkdir(parents=True, exist_ok=True)
+    partition_date = date.fromisoformat(partition_date_str)
+    config = load_variables_config()
+    definitions = config.section(section)
+    variables = [d.name for d in definitions]
+    time_vars = time_variables(definitions, [raw for _, raw, _ in bronze_rows], section)
+    record_model = build_record_model(section, {v: v in time_vars for v in variables})
 
-    all_records: list[dict] = []
+    records: list[dict] = []
     invalid_count = 0
     total_raw = 0
+    unsupported: dict[str, list[str]] = {}
 
-    for location in locations:
-        bronze_file = bronze_dir / location.name / f"{partition_date_str}.parquet"
-
-        if not bronze_file.exists():
-            context.log.warning(
-                f"Bronze file not found for {location.name} on {partition_date_str}, skipping"
-            )
-            continue
-
-        # Read Bronze Parquet
-        bronze_table = pq.read_table(str(bronze_file))
-        bronze_df = bronze_table.to_pandas()
-
-        for _, row in bronze_df.iterrows():
-            raw_json = json.loads(row["raw_json"])
-
-            # Parse hourly data from the JSON response
-            hourly_records = _parse_hourly_data(
-                raw_json=raw_json,
-                location_name=location.name,
-                latitude=raw_json.get("latitude", location.latitude),
-                longitude=raw_json.get("longitude", location.longitude),
-                local_timezone=location.timezone,
-                partition_date=partition_date_str,
-                ingestion_ts=pd.Timestamp(row["ingestion_timestamp"]).to_pydatetime(),
-            )
-
-            total_raw += len(hourly_records)
-
-            # Validate each record with Pydantic
-            for rec in hourly_records:
-                try:
-                    validated = HourlyWeatherRecord(**rec)
-                    all_records.append(validated.model_dump())
-                except Exception as e:
-                    invalid_count += 1
-                    if invalid_count <= 5:  # Only log first 5
-                        context.log.warning(f"Invalid record for {location.name}: {e}")
-
-    if not all_records:
-        context.log.warning(f"No valid records for partition {partition_date_str}")
-        # Write empty Parquet with the Silver columns
-        empty_df = pd.DataFrame(columns=SILVER_COLUMNS)
-        empty_df.to_parquet(
-            str(silver_dir / f"{partition_date_str}.parquet"), compression="snappy", index=False
+    for location, raw_json, ingestion_ts in bronze_rows:
+        parsed = parse_section(
+            raw_json, section, variables, time_vars, location, partition_date, ingestion_ts
         )
-        return
+        total_raw += len(parsed)
+        missing = unsupported_variables(raw_json).get(section)
+        if missing:
+            unsupported[location.name] = missing
 
-    # Create DataFrame and deduplicate
-    df = pd.DataFrame(all_records)
+        for rec in parsed:
+            try:
+                records.append(record_model(**rec).model_dump())
+            except Exception as e:
+                invalid_count += 1
+                if invalid_count <= 5:  # Only log first 5
+                    context.log.warning(f"Invalid {section} record for {location.name}: {e}")
 
-    # Convert timestamp columns and enforce float64 for weather variables
-    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
-    df["timestamp_local"] = pd.to_datetime(df["timestamp_local"])
-    df["ingestion_timestamp"] = pd.to_datetime(df["ingestion_timestamp"], utc=True)
-    df[WEATHER_COLUMNS] = df[WEATHER_COLUMNS].astype("float64")
-    df = df[SILVER_COLUMNS]
+    df = to_silver_frame(section, records, variables, time_vars)
 
-    # Deduplicate: keep last (most recent ingestion) for each location+timestamp
+    # Deduplicate: keep last (most recent ingestion) for each key
+    keys = SECTION_KEYS[section]
     before_dedup = len(df)
-    df = df.sort_values("ingestion_timestamp").drop_duplicates(
-        subset=["location_name", "timestamp_utc"],
-        keep="last",
+    df = df.sort_values("ingestion_timestamp", kind="stable").drop_duplicates(
+        subset=keys, keep="last"
     )
     duplicates_removed = before_dedup - len(df)
+    df = df.sort_values(keys).reset_index(drop=True)
 
-    # Sort by location and timestamp
-    df = df.sort_values(["location_name", "timestamp_utc"]).reset_index(drop=True)
-
-    # Write Silver Parquet
-    output_path = silver_dir / f"{partition_date_str}.parquet"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(str(output_path), compression="snappy", index=False)
 
-    # Calculate null statistics for metadata
-    null_stats = {}
-    for col in WEATHER_COLUMNS:
-        if col in df.columns:
-            null_count = df[col].isna().sum()
-            null_stats[f"{col}_null_pct"] = round(null_count / len(df) * 100, 1)
-
+    if df.empty:
+        context.log.warning(f"No valid {section} records for partition {partition_date_str}")
+    null_stats = {
+        f"{var}_null_pct": round(float(df[var].isna().mean()) * 100, 1)
+        for var in variables
+        if len(df)
+    }
     context.add_output_metadata(
         {
             "partition_date": partition_date_str,
@@ -252,14 +280,107 @@ def silver_hourly_weather(
             "raw_records_parsed": total_raw,
             "invalid_records_skipped": invalid_count,
             "duplicates_removed": duplicates_removed,
+            "columns": MetadataValue.json(list(df.columns)),
             "locations": MetadataValue.text(", ".join(df["location_name"].unique())),
             "null_statistics": MetadataValue.json(null_stats),
+            "unsupported_variables": MetadataValue.json(unsupported),
         }
     )
-
     context.log.info(
-        f"Silver: {len(df)} records for {partition_date_str} "
+        f"Silver {section}: {len(df)} records for {partition_date_str} "
         f"({invalid_count} invalid, {duplicates_removed} duplicates removed)"
+    )
+    return df
+
+
+def _bronze_weather_rows(context: AssetExecutionContext) -> list[BronzeRow]:
+    """Load the hourly/daily Bronze responses of all locations for the partition."""
+    partition_date_str = context.partition_key
+    bronze_dir = get_data_dir() / "bronze"
+    rows: list[BronzeRow] = []
+
+    for location in load_locations_config():
+        bronze_file = bronze_dir / location.name / f"{partition_date_str}.parquet"
+        if not bronze_file.exists():
+            context.log.warning(
+                f"Bronze file not found for {location.name} on {partition_date_str}, skipping"
+            )
+            continue
+        for row in pq.read_table(str(bronze_file)).to_pylist():
+            ingestion_ts = pd.Timestamp(row["ingestion_timestamp"]).to_pydatetime()
+            rows.append((location, json.loads(row["raw_json"]), ingestion_ts))
+    return rows
+
+
+@asset(
+    partitions_def=daily_partitions,
+    group_name="silver",
+    compute_kind="python",
+    deps=[bronze_forecast],
+    description="Cleaned, typed, validated hourly weather records (columns from config).",
+)
+def silver_hourly_weather(context: AssetExecutionContext) -> None:
+    """Hourly records for the UTC partition day, one column per hourly variable."""
+    output_path = silver_path("hourly", context.partition_key)
+    build_silver_section(context, "hourly", _bronze_weather_rows(context), output_path)
+
+
+@asset(
+    partitions_def=daily_partitions,
+    group_name="silver",
+    compute_kind="python",
+    deps=[bronze_forecast],
+    description="Daily aggregates per location for the local day equal to the partition date.",
+)
+def silver_daily_weather(context: AssetExecutionContext) -> None:
+    """Open-Meteo daily aggregates over each location's local calendar day."""
+    output_path = silver_path("daily", context.partition_key)
+    build_silver_section(context, "daily", _bronze_weather_rows(context), output_path)
+
+
+def range_issues(df: pd.DataFrame, definitions: list[VariableDefinition]) -> list[str]:
+    """Return a message per variable whose values fall outside its valid_range."""
+    issues = []
+    for d in definitions:
+        if d.valid_range is None or d.name not in df.columns:
+            continue
+        values = df[d.name].dropna()
+        if values.empty:
+            continue
+        min_val, max_val = d.valid_range
+        actual_min, actual_max = values.min(), values.max()
+        if actual_min < min_val or actual_max > max_val:
+            issues.append(
+                f"{d.name} out of range [{min_val}, {max_val}]: "
+                f"actual [{actual_min}, {actual_max}]"
+            )
+    return issues
+
+
+def check_result(df: pd.DataFrame, issues: list[str], partition_date: str) -> AssetCheckResult:
+    """Build an AssetCheckResult from a list of issues."""
+    passed = not issues
+    return AssetCheckResult(
+        passed=passed,
+        metadata={
+            "row_count": len(df),
+            "locations_found": list(df["location_name"].unique()),
+            "issues": issues if issues else ["All checks passed"],
+            "partition_date": partition_date,
+        },
+        description=(
+            f"All quality checks passed ({len(df)} rows)"
+            if passed
+            else f"Quality issues: {'; '.join(issues)}"
+        ),
+    )
+
+
+def _missing_file_result(path: Path, partition_date: str) -> AssetCheckResult:
+    return AssetCheckResult(
+        passed=False,
+        metadata={"error": f"Silver file not found: {path.name}"},
+        description=f"Silver file missing for {partition_date}",
     )
 
 
@@ -270,17 +391,11 @@ def silver_hourly_weather(
     ),
 )
 def silver_quality_check(context) -> AssetCheckResult:
-    """Comprehensive data quality check on Silver layer data."""
+    """Comprehensive data quality check on hourly Silver data."""
     partition_date_str = context.partition_key
-    silver_dir = get_data_dir() / "silver"
-    silver_file = silver_dir / f"{partition_date_str}.parquet"
-
+    silver_file = silver_path("hourly", partition_date_str)
     if not silver_file.exists():
-        return AssetCheckResult(
-            passed=False,
-            metadata={"error": "Silver file not found"},
-            description=f"Silver file missing for {partition_date_str}",
-        )
+        return _missing_file_result(silver_file, partition_date_str)
 
     df = pd.read_parquet(str(silver_file))
     locations = load_locations_config()
@@ -300,40 +415,35 @@ def silver_quality_check(context) -> AssetCheckResult:
         if temp_null_pct > 5.0:
             issues.append(f"temperature_2m null rate {temp_null_pct:.1f}% exceeds 5%")
 
-    # 3. Value range checks
-    for col, (min_val, max_val) in VALUE_RANGES.items():
-        if col in df.columns:
-            valid_values = df[col].dropna()
-            if len(valid_values) > 0:
-                actual_min = valid_values.min()
-                actual_max = valid_values.max()
-                if actual_min < min_val or actual_max > max_val:
-                    issues.append(
-                        f"{col} out of range [{min_val}, {max_val}]: "
-                        f"actual [{actual_min}, {actual_max}]"
-                    )
+    # 3. Value range checks (valid_range in config)
+    issues += range_issues(df, load_variables_config().hourly_variables)
 
     # 4. No duplicate (location_name, timestamp_utc) pairs
-    if "timestamp_utc" in df.columns and "location_name" in df.columns:
-        dupes = df.duplicated(subset=["location_name", "timestamp_utc"]).sum()
-        if dupes > 0:
-            issues.append(f"{dupes} duplicate (location, timestamp) pairs found")
+    dupes = df.duplicated(subset=SECTION_KEYS["hourly"]).sum()
+    if dupes > 0:
+        issues.append(f"{dupes} duplicate (location, timestamp) pairs found")
 
-    passed = len(issues) == 0
+    return check_result(df, issues, partition_date_str)
 
-    return AssetCheckResult(
-        passed=passed,
-        metadata={
-            "row_count": len(df),
-            "locations_found": (
-                list(df["location_name"].unique()) if "location_name" in df.columns else []
-            ),
-            "issues": issues if issues else ["All checks passed"],
-            "partition_date": partition_date_str,
-        },
-        description=(
-            f"All quality checks passed ({len(df)} rows)"
-            if passed
-            else f"Quality issues: {'; '.join(issues)}"
-        ),
-    )
+
+@asset_check(
+    asset=silver_daily_weather,
+    description="Validate Silver daily data: one row per location, value ranges.",
+)
+def silver_daily_check(context) -> AssetCheckResult:
+    """Check daily Silver data has exactly one in-range row per configured location."""
+    partition_date_str = context.partition_key
+    silver_file = silver_path("daily", partition_date_str)
+    if not silver_file.exists():
+        return _missing_file_result(silver_file, partition_date_str)
+
+    df = pd.read_parquet(str(silver_file))
+    expected = sorted(loc.name for loc in load_locations_config())
+    issues: list[str] = []
+
+    found = sorted(df["location_name"])
+    if found != expected:
+        issues.append(f"Expected one row per location {expected}, found {found}")
+    issues += range_issues(df, load_variables_config().daily_variables)
+
+    return check_result(df, issues, partition_date_str)

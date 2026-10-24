@@ -12,7 +12,8 @@ from weather_forecast.assets.gold import (
     gold_daily_temperature,
     gold_temperature_check,
 )
-from weather_forecast.assets.silver import SILVER_COLUMNS, silver_hourly_weather
+from weather_forecast.assets.silver import section_columns, silver_hourly_weather, silver_path
+from weather_forecast.utils.helpers import load_variables_config
 
 
 def _write_silver(data_dir, locations, partition_date):
@@ -43,9 +44,10 @@ def _write_silver(data_dir, locations, partition_date):
                     "ingestion_timestamp": start,
                 }
             )
-    df = pd.DataFrame(rows, columns=SILVER_COLUMNS)
-    (data_dir / "silver").mkdir(parents=True, exist_ok=True)
-    df.to_parquet(data_dir / "silver" / f"{partition_date}.parquet", index=False)
+    df = pd.DataFrame(rows, columns=section_columns("hourly", load_variables_config().hourly_names))
+    path = silver_path("hourly", partition_date.isoformat())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path, index=False)
     return df
 
 

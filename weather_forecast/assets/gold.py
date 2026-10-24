@@ -24,7 +24,7 @@ from dagster import (
     asset_check,
 )
 
-from weather_forecast.assets.silver import silver_hourly_weather
+from weather_forecast.assets.silver import silver_hourly_weather, silver_path
 from weather_forecast.partitions import daily_partitions
 from weather_forecast.resources.duckdb_resource import DuckDBResource
 from weather_forecast.utils.helpers import get_data_dir, load_locations_config
@@ -55,7 +55,7 @@ def gold_daily_temperature(
     """
     partition_date_str = context.partition_key
     data_dir = get_data_dir()
-    silver_file = data_dir / "silver" / f"{partition_date_str}.parquet"
+    silver_file = silver_path("hourly", partition_date_str)
 
     if not silver_file.exists():
         context.log.warning(f"Silver file not found for {partition_date_str}, skipping Gold")
@@ -150,7 +150,7 @@ def gold_daily_precipitation(
     """
     partition_date_str = context.partition_key
     data_dir = get_data_dir()
-    silver_file = data_dir / "silver" / f"{partition_date_str}.parquet"
+    silver_file = silver_path("hourly", partition_date_str)
 
     if not silver_file.exists():
         context.log.warning(f"Silver file not found for {partition_date_str}, skipping Gold")
