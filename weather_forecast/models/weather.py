@@ -10,10 +10,17 @@ from __future__ import annotations
 
 import re
 from datetime import date, datetime
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, Field, create_model, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    Field,
+    create_model,
+    field_validator,
+    model_validator,
+)
 
 # Query parameters the pipeline sets itself; they can't be overridden via extra_params
 RESERVED_API_PARAMS = frozenset(
@@ -357,7 +364,18 @@ class SilverRecord(BaseModel):
         return v
 
 
-_KIND_TYPES = {"time": datetime, "integer": int, "float": float}
+def _reject_bool(value):
+    """Pydantic would coerce True/False to 1/0 for numeric fields; a boolean isn't a reading."""
+    if isinstance(value, bool):
+        raise ValueError("boolean is not a valid numeric value")
+    return value
+
+
+_KIND_TYPES = {
+    "time": datetime,
+    "integer": Annotated[int, BeforeValidator(_reject_bool)],
+    "float": Annotated[float, BeforeValidator(_reject_bool)],
+}
 
 
 def build_record_model(section: Section, variables: dict[str, VariableKind]) -> type[SilverRecord]:

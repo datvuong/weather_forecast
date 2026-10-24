@@ -239,6 +239,13 @@ class TestBuildRecordModel:
         assert "cloud_cover" in model.model_fields
         assert "temperature_2m" not in model.model_fields
 
+    @pytest.mark.parametrize("kind,value", [("float", True), ("float", False), ("integer", True)])
+    def test_booleans_rejected_for_numbers(self, kind, value):
+        # Pydantic would otherwise coerce True -> 1.0 / 1 (#40)
+        model = build_record_model("hourly", {"x": kind})
+        with pytest.raises(ValidationError, match="boolean"):
+            model(**_record(), x=value)
+
     def test_integer_variable(self):
         model = build_record_model("hourly", {"weather_code": "integer"})
         base = _record()

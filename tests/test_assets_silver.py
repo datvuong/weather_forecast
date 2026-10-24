@@ -4,11 +4,14 @@ from datetime import date, datetime, timedelta, timezone
 
 import dagster as dg
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from tests.conftest import make_api_response, write_bronze_file
 from weather_forecast.assets.bronze import bronze_forecast
 from weather_forecast.assets.silver import (
+    MalformedResponseError,
     parse_section,
     section_columns,
     silver_daily_check,
@@ -153,7 +156,29 @@ class TestParseSection:
         raw = make_api_response(date(2026, 10, 21))
         raw["hourly_units"]["time"] = "iso8601"
 
-        with pytest.raises(ValueError, match="unixtime"):
+        with pytest.raises(MalformedResponseError, match="unixtime"):
+            _parse(raw)
+
+    def test_rejects_missing_units_block(self):
+        raw = make_api_response(date(2026, 10, 21))
+        del raw["hourly_units"]
+
+        with pytest.raises(MalformedResponseError, match="unixtime"):
+            _parse(raw)
+
+    def test_rejects_truncated_variable_array(self):
+        # Silently null-padding would make a truncated response look like legit nulls (#40)
+        raw = make_api_response(date(2026, 10, 21))
+        raw["hourly"]["temperature_2m"] = raw["hourly"]["temperature_2m"][:12]
+
+        with pytest.raises(MalformedResponseError, match="temperature_2m"):
+            _parse(raw)
+
+    def test_rejects_too_long_variable_array(self):
+        raw = make_api_response(date(2026, 10, 21))
+        raw["hourly"]["uv_index"] = raw["hourly"]["uv_index"] + [1.0]
+
+        with pytest.raises(MalformedResponseError, match="uv_index"):
             _parse(raw)
 
 
@@ -366,3 +391,67 @@ class TestSilverQualityCheck:
         # The fixture's temperatures reach 26.5 °C
         assert not evaluation.passed
         assert "temperature_2m out of range [0.0, 20.0]" in evaluation.description
+
+
+class TestMalformedResponses:
+    def test_one_malformed_location_doesnt_block_the_others(self, data_dir, locations, past_date):
+        pk = past_date.isoformat()
+        good = make_api_response(past_date - timedelta(days=1), days=3)
+        bad = make_api_response(past_date - timedelta(days=1), days=3)
+        bad["hourly"]["temperature_2m"] = bad["hourly"]["temperature_2m"][:10]
+        write_bronze_file(data_dir, locations[0].name, pk, [(good, INGESTED)])
+        write_bronze_file(data_dir, locations[1].name, pk, [(bad, INGESTED)])
+
+        result = _materialize(pk, [silver_hourly_weather], [silver_quality_check])
+
+        assert result.success  # the good location is still written
+        df = pd.read_parquet(silver_path("hourly", pk))
+        assert set(df["location_name"]) == {locations[0].name}
+        metadata = result.asset_materializations_for_node("silver_hourly_weather")[0].metadata
+        assert list(metadata["malformed_responses"].value) == [locations[1].name]
+        [evaluation] = result.get_asset_check_evaluations()
+        assert not evaluation.passed  # the missing location is flagged
+        assert "below expected minimum" in evaluation.description
+
+    def test_missing_units_location_is_skipped(self, data_dir, locations, past_date):
+        pk = past_date.isoformat()
+        bad = make_api_response(past_date - timedelta(days=1), days=3)
+        bad.pop("hourly_units")
+        write_bronze_file(
+            data_dir, locations[0].name, pk,
+            [(make_api_response(past_date - timedelta(days=1), days=3), INGESTED)],
+        )
+        write_bronze_file(data_dir, locations[1].name, pk, [(bad, INGESTED)])
+
+        result = _materialize(pk, [silver_hourly_weather])
+
+        assert result.success
+        assert len(pd.read_parquet(silver_path("hourly", pk))) == 24
+
+    def test_boolean_values_are_invalid_records(self, data_dir, locations, past_date):
+        pk = past_date.isoformat()
+        raw = make_api_response(past_date)
+        raw["hourly"]["temperature_2m"][3] = True
+        raw["hourly"]["weather_code"][4] = False
+        for loc in locations:
+            write_bronze_file(data_dir, loc.name, pk, [(raw, INGESTED)])
+
+        result = _materialize(pk, [silver_hourly_weather])
+
+        metadata = result.asset_materializations_for_node("silver_hourly_weather")[0].metadata
+        assert metadata["invalid_records_skipped"].value == 2 * len(locations)
+        assert len(pd.read_parquet(silver_path("hourly", pk))) == 22 * len(locations)
+
+
+@pytest.mark.parametrize("section", ["hourly", "daily"])
+def test_empty_silver_file_has_real_types(data_dir, past_date, section):
+    pk = past_date.isoformat()
+    selected = silver_hourly_weather if section == "hourly" else silver_daily_weather
+
+    _materialize(pk, [selected])
+
+    schema = pq.read_schema(silver_path(section, pk))
+    assert not [f.name for f in schema if pa.types.is_null(f.type)]
+    assert schema.field("location_id").type == pa.string()
+    if section == "daily":
+        assert schema.field("date_local").type == pa.date32()

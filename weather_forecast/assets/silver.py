@@ -23,6 +23,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 from dagster import (
     AssetCheckResult,
@@ -66,6 +67,10 @@ SECTION_KEYS: dict[str, list[str]] = {
 
 # A raw API response with its location and Bronze ingestion time
 BronzeRow = tuple[LocationConfig, dict[str, Any], datetime]
+
+
+class MalformedResponseError(ValueError):
+    """An API response that doesn't have the expected structure (not just missing values)."""
 
 
 def silver_path(section: Section, partition_date: str) -> Path:
@@ -156,7 +161,11 @@ def parse_section(
         ingestion_ts: When the data was ingested (from Bronze).
 
     Returns:
-        List of dicts, one per record; missing variables are None.
+        List of dicts, one per record; variables absent from the response are None.
+
+    Raises:
+        MalformedResponseError: The section's units/time format are missing or a
+            variable array's length differs from the time array.
     """
     data = raw_json.get(section) or {}
     if section == "current" and data:
@@ -168,7 +177,18 @@ def parse_section(
 
     time_format = (raw_json.get(f"{section}_units") or {}).get("time")
     if time_format != "unixtime":
-        raise ValueError(f"Expected unixtime {section} timestamps from API, got {time_format!r}")
+        raise MalformedResponseError(
+            f"Expected unixtime {section} timestamps from API, got {time_format!r}"
+        )
+    # A truncated array would otherwise be padded with nulls and look like legitimate
+    # missing data (nulls are kept on purpose), so a length mismatch is structural
+    mismatched = {
+        var: len(data[var]) for var in kinds if var in data and len(data[var]) != len(timestamps)
+    }
+    if mismatched:
+        raise MalformedResponseError(
+            f"{section} arrays don't match {len(timestamps)} timestamps: {mismatched}"
+        )
     tz = ZoneInfo(location.timezone)
     utc_offset = raw_json.get("utc_offset_seconds", 0)
 
@@ -189,7 +209,7 @@ def parse_section(
         }
         for var in kinds:
             values = data.get(var, [])
-            value = values[i] if i < len(values) else None
+            value = values[i] if values else None
             if kinds[var] == "time" and isinstance(value, (int, float)):
                 value = epoch_to_utc(value)
             record[var] = value
@@ -228,6 +248,22 @@ def to_silver_frame(
     return df
 
 
+def _typed_table(df: pd.DataFrame) -> pa.Table:
+    """Arrow table for an empty frame, with real types instead of null-typed columns.
+
+    pandas has no values to infer string/date columns from, so pyarrow would
+    type them as null; date_local becomes date32 and other untyped columns string.
+    """
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    fields = [
+        pa.field(f.name, pa.date32() if f.name == "date_local" else pa.string())
+        if pa.types.is_null(f.type)
+        else f
+        for f in table.schema
+    ]
+    return table.cast(pa.schema(fields))
+
+
 def build_silver_section(
     context: AssetExecutionContext,
     section: Section,
@@ -254,11 +290,19 @@ def build_silver_section(
     invalid_count = 0
     total_raw = 0
     unsupported: dict[str, list[str]] = {}
+    malformed: dict[str, str] = {}
 
     for location, raw_json, ingestion_ts in bronze_rows:
-        parsed = parse_section(
-            raw_json, section, kinds, location, partition_date, ingestion_ts
-        )
+        try:
+            parsed = parse_section(
+                raw_json, section, kinds, location, partition_date, ingestion_ts
+            )
+        except MalformedResponseError as e:
+            # Skip this location only: the others are still written, and the quality
+            # checks fail on its missing rows
+            malformed[location.name] = str(e)
+            context.log.error(f"Malformed {section} response for {location.name}, skipped: {e}")
+            continue
         total_raw += len(parsed)
         missing = unsupported_variables(raw_json).get(section)
         if missing:
@@ -283,7 +327,7 @@ def build_silver_section(
     duplicates_removed = before_dedup - len(df)
     df = df.sort_values(keys).reset_index(drop=True)
 
-    write_parquet(df, output_path)
+    write_parquet(_typed_table(df) if df.empty else df, output_path)
 
     if df.empty:
         context.log.warning(f"No valid {section} records for partition {partition_date_str}")
@@ -303,6 +347,7 @@ def build_silver_section(
             "locations": MetadataValue.text(", ".join(df["location_name"].unique())),
             "null_statistics": MetadataValue.json(null_stats),
             "unsupported_variables": MetadataValue.json(unsupported),
+            "malformed_responses": MetadataValue.json(malformed),
         }
     )
     context.log.info(

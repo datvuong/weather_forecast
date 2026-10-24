@@ -69,24 +69,28 @@ def write_bronze_record(
     return output_path.stat().st_size
 
 
-def _covers_partition(raw_response: dict, partition_date: date) -> bool:
+def _covers_partition(
+    raw_response: dict, partition_date: date, sections: tuple[str, ...] = ("hourly", "daily")
+) -> bool:
     """Return True if the response has data for the partition day.
 
-    Requested sections are checked separately: some hourly value within the
-    UTC day, and some daily value for the local date equal to the partition
-    (dated with the response's fixed utc_offset_seconds, like Silver).
-    The archive API lags behind real time and returns null-filled arrays for
-    days it does not have yet, rather than an error.
+    Each requested section (`sections`) is checked separately: some hourly
+    value within the UTC day, and some daily value for the local date equal to
+    the partition (dated with the response's fixed utc_offset_seconds, like
+    Silver). A requested section missing from the response counts as not
+    covered. The archive API lags behind real time and returns null-filled
+    arrays for days it does not have yet, rather than an error.
     """
     utc_offset = raw_response.get("utc_offset_seconds", 0)
     checks = {
         "hourly": lambda t: epoch_to_utc(t).date() == partition_date,
         "daily": lambda t: daily_epoch_to_date(t, utc_offset) == partition_date,
     }
-    for section, in_partition in checks.items():
+    for section in sections:
+        in_partition = checks[section]
         data = raw_response.get(section)
-        if not data or len(data) <= 1:  # section not requested (only "time")
-            continue
+        if not data or len(data) <= 1:  # requested but missing, or only "time"
+            return False
         rows = [i for i, t in enumerate(data.get("time", [])) if in_partition(t)]
         has_values = any(
             values[i] is not None
@@ -144,7 +148,8 @@ def _fetch_location(
     )
     try:
         raw_response = client.fetch("archive", window)
-        if _covers_partition(raw_response, partition_date):
+        requested = tuple(s for s in ("hourly", "daily") if variables_config.names(s))
+        if _covers_partition(raw_response, partition_date, requested):
             return raw_response, "archive"
         context.log.warning(
             f"Archive API has no data yet for {location.name} on {partition_date}, "

@@ -27,7 +27,8 @@ def _materialize(client, partition_key):
 
 
 def _window_response(partition_date, **kwargs):
-    """A response covering local dates d-1..d+1, like the real Bronze request."""
+    """A response covering local dates d-1..d+1 with the configured sections, like the real API."""
+    kwargs.setdefault("daily_variables", load_variables_config().daily_names)
     return make_api_response(partition_date - timedelta(days=1), days=3, **kwargs)
 
 
@@ -115,6 +116,18 @@ def test_archive_error_falls_back_to_forecast(data_dir, locations, past_date):
     assert row["api_endpoint"] == "forecast"
 
 
+def test_archive_missing_requested_section_falls_back_to_forecast(data_dir, past_date):
+    archive_without_daily = _window_response(past_date, daily_variables=())
+    client = FakeOpenMeteoClient(
+        archive_response=archive_without_daily, forecast_response=_window_response(past_date)
+    )
+
+    result = _materialize(client, past_date.isoformat())
+
+    assert result.success
+    assert {kind for kind, _ in client.calls} == {"archive", "forecast"}
+
+
 def test_unsupported_variables_reported_in_metadata(data_dir, locations, past_date):
     response = _window_response(past_date, unsupported=["precipitation_probability"])
     client = FakeOpenMeteoClient(archive_response=response)
@@ -140,11 +153,11 @@ class TestCoversPartition:
                 "temperature_2m_max": [25.5, None, 14.7],
             },
         }
-        assert _covers_partition(response, date(2026, 9, 24))
-        assert not _covers_partition(response, date(2026, 9, 25))  # its own row is null
+        assert _covers_partition(response, date(2026, 9, 24), ("daily",))
+        assert not _covers_partition(response, date(2026, 9, 25), ("daily",))  # null row
 
     def test_hourly_data_in_utc_day(self):
-        assert _covers_partition(make_api_response(self.day), self.day)
+        assert _covers_partition(make_api_response(self.day), self.day, ("hourly",))
 
     def test_hourly_data_only_outside_utc_day(self):
         response = make_api_response(self.day - timedelta(days=1))
@@ -161,6 +174,12 @@ class TestCoversPartition:
         response = make_api_response(self.day, daily_variables=["temperature_2m_max"])
         response["daily"]["temperature_2m_max"] = [None]
         assert not _covers_partition(response, self.day)
+
+    def test_missing_requested_section_is_not_covered(self):
+        # e.g. an archive response without the daily section the config asks for (#40)
+        hourly_only = make_api_response(self.day)
+        assert _covers_partition(hourly_only, self.day, ("hourly",))
+        assert not _covers_partition(hourly_only, self.day, ("hourly", "daily"))
 
     def test_daily_row_for_local_date(self):
         response = make_api_response(self.day, daily_variables=["temperature_2m_max"])
