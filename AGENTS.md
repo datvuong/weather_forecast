@@ -59,6 +59,19 @@ weather_forecast/
 3. **Asset pipeline:** `weather_forecast/assets/bronze.py` → `silver.py` → `gold.py` — follow the data flow
 4. **Data models:** `weather_forecast/models/weather.py` — Pydantic schemas define the data contracts
 
+## Development Workflow (mandatory)
+
+All work, by humans or agents, follows the plan in `docs/implementation-plan.md` and is tracked on GitHub:
+
+1. **Story.** Every phase or feature has a `[Story] Phase N: …` issue (label `enhancement`) with a user story, acceptance criteria, estimate and dependencies. Reuse the existing story; don't open a duplicate.
+2. **Issues.** Concrete work and defects are `[Task] …` / `[Bug] …` issues. Each body has *Problem* and a *Tasks* checklist, and each is linked as a **sub-issue** of its story:
+   ```bash
+   id=$(gh api repos/datvuong/weather_forecast/issues/<issue> -q .id)
+   gh api -X POST repos/datvuong/weather_forecast/issues/<story>/sub_issues -F sub_issue_id=$id
+   ```
+3. **Commits.** Make one commit per story/issue, as soon as that work is done; don't leave finished work uncommitted. Use a Conventional Commits subject (`feat|fix|test|docs|chore: Phase N — summary`). The body explains what changed and why, grouped by file or area, plus the tests and verification, and ends with `Closes #<story>` / `Closes #<issue>`. Every commit must pass `pytest` and `ruff check .` on its own.
+4. **Definition of done.** New behaviour has tests, `pytest` and `ruff check .` pass, and README/AGENTS.md are updated when behaviour or conventions change.
+
 ## Development Setup
 
 ```bash
