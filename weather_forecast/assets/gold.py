@@ -1,7 +1,12 @@
 """Gold layer assets — aggregated daily weather summaries.
 
-Reads Silver Parquet files, computes daily aggregations using DuckDB,
+Reads Silver hourly Parquet files, computes daily aggregations using DuckDB,
 and dual-writes to both Parquet files and DuckDB tables.
+
+A Gold partition is a LOCAL calendar day: partition d holds each location's
+day d in its own timezone, built from the hourly rows of the neighbouring UTC
+Silver partitions (d-1..d+1). `hours_covered` / `total_hours` show how many
+hours went in (24, or 23/25 on DST change days).
 
 Gold assets:
 - gold_daily_temperature: min/max/avg temperature, humidity, wind, UV
@@ -18,14 +23,20 @@ File layout:
 """
 
 import logging
+import warnings
+from datetime import date, timedelta
 from pathlib import Path
 
 import duckdb
 import pandas as pd
 from dagster import (
     AssetCheckResult,
+    AssetCheckSeverity,
+    AssetDep,
     AssetExecutionContext,
+    BetaWarning,
     MetadataValue,
+    TimeWindowPartitionMapping,
     asset,
     asset_check,
 )
@@ -93,6 +104,7 @@ TEMPERATURE_COLUMNS = {
     "humidity_avg_pct": "DOUBLE",
     "wind_max_kmh": "DOUBLE",
     "uv_max": "DOUBLE",
+    "hours_covered": "INTEGER",
 }
 
 PRECIPITATION_COLUMNS = {
@@ -115,16 +127,48 @@ def gold_path(metric: str, partition_date: str) -> Path:
     return get_data_dir() / "gold" / metric / f"{partition_date}.parquet"
 
 
-def _load_hourly(context: AssetExecutionContext) -> pd.DataFrame | None:
-    """Load the Silver hourly rows the partition aggregates (None if missing).
+# A local calendar day spans the neighbouring UTC days for any UTC offset. The
+# last partition (today) maps to tomorrow's not-yet-existing Silver partition,
+# which must be allowed; Dagster marks that parameter beta, so its warning is
+# silenced here only.
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", BetaWarning)
+    LOCAL_DAY_PARTITION_MAPPING = TimeWindowPartitionMapping(
+        start_offset=-1, end_offset=1, allow_nonexistent_upstream_partitions=True
+    )
+SILVER_HOURLY_LOCAL_DAY_DEP = AssetDep(
+    silver_hourly_weather, partition_mapping=LOCAL_DAY_PARTITION_MAPPING
+)
 
-    Rows from files written before location_id existed get it from config.
+
+def load_local_day_hourly(partition_date: str) -> pd.DataFrame:
+    """Silver hourly rows whose LOCAL date is partition_date, for every location.
+
+    Silver hourly partitions hold UTC days. A location's local day d spans UTC
+    days d-1..d+1 (positive offsets reach back, negative ones forward), so the
+    three neighbouring files are read and filtered on timestamp_local. Rows from
+    files written before location_id existed get it from config.
     """
-    silver_file = silver_path("hourly", context.partition_key)
-    if not silver_file.exists():
-        context.log.warning(f"Silver file not found for {context.partition_key}, skipping Gold")
+    day = date.fromisoformat(partition_date)
+    frames = [
+        pd.read_parquet(str(path))
+        for offset in (-1, 0, 1)
+        if (path := silver_path("hourly", (day + timedelta(days=offset)).isoformat())).exists()
+    ]
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        return pd.DataFrame()
+    hourly = fill_location_ids(pd.concat(frames, ignore_index=True))
+    return hourly[hourly["timestamp_local"].dt.date == day].reset_index(drop=True)
+
+
+def _load_hourly(context: AssetExecutionContext) -> pd.DataFrame | None:
+    """Load the hourly rows of the partition's local day (None if there are none)."""
+    hourly = load_local_day_hourly(context.partition_key)
+    if hourly.empty:
+        context.log.warning(f"No Silver hourly rows for local day {context.partition_key}")
         return None
-    return fill_location_ids(pd.read_parquet(str(silver_file)))
+    return hourly
 
 
 def _write_gold(
@@ -181,7 +225,7 @@ def _aggregate(hourly: pd.DataFrame, select_sql: str, partition_date: str) -> pd
     partitions_def=daily_partitions,
     group_name="gold",
     compute_kind="duckdb",
-    deps=[silver_hourly_weather],
+    deps=[SILVER_HOURLY_LOCAL_DAY_DEP],
     description="Daily temperature summary: min/max/avg temps, humidity, wind, UV by location.",
 )
 def gold_daily_temperature(
@@ -190,7 +234,8 @@ def gold_daily_temperature(
 ) -> None:
     """Compute daily temperature and related weather aggregations.
 
-    Aggregates the Silver hourly rows for this partition:
+    Aggregates the Silver hourly rows of each location's LOCAL calendar day
+    equal to the partition date:
     - Min/max/avg temperature (24h and daytime 6am-6pm)
     - Average humidity
     - Max wind speed
@@ -213,7 +258,8 @@ def gold_daily_temperature(
                 THEN temperature_2m END) AS daytime_temp_max_c,
             ROUND(AVG(relative_humidity_2m), 2) AS humidity_avg_pct,
             MAX(wind_speed_10m) AS wind_max_kmh,
-            MAX(uv_index) AS uv_max
+            MAX(uv_index) AS uv_max,
+            COUNT(*) AS hours_covered
         """,
         context.partition_key,
     )
@@ -227,7 +273,7 @@ def gold_daily_temperature(
     partitions_def=daily_partitions,
     group_name="gold",
     compute_kind="duckdb",
-    deps=[silver_hourly_weather],
+    deps=[SILVER_HOURLY_LOCAL_DAY_DEP],
     description="Daily precipitation summary: totals, probability, rainy hours by location.",
 )
 def gold_daily_precipitation(
@@ -236,7 +282,8 @@ def gold_daily_precipitation(
 ) -> None:
     """Compute daily precipitation aggregations.
 
-    Aggregates the Silver hourly rows for this partition:
+    Aggregates the Silver hourly rows of each location's LOCAL calendar day
+    equal to the partition date:
     - Total precipitation (mm)
     - Max and average precipitation probability
     - Number of rainy hours and percentage
@@ -267,9 +314,45 @@ def gold_daily_precipitation(
     )
 
 
+# Expected hours in a local day (DST change days have 23 or 25)
+COMPLETE_DAY_HOURS = (23, 25)
+SILVER_DAILY_TOLERANCE_C = 0.5
+
+
+def _silver_daily_differences(df: pd.DataFrame, partition_date: str) -> list[str]:
+    """Compare Gold min/max with the API's daily aggregates in Silver daily.
+
+    Only a warning: the API computes days with the response's fixed UTC offset,
+    so across a DST change its window is shifted by an hour.
+    """
+    path = silver_path("daily", partition_date)
+    if not path.exists():
+        return []
+    daily = fill_location_ids(pd.read_parquet(str(path))).set_index("location_id")
+    differences = []
+    for _, row in df.iterrows():
+        if row["location_id"] not in daily.index:
+            continue
+        for gold_col, api_col in (("temp_max_c", "temperature_2m_max"),
+                                  ("temp_min_c", "temperature_2m_min")):
+            if api_col not in daily.columns:
+                continue
+            api_value = daily.loc[row["location_id"], api_col]
+            if pd.notna(api_value) and pd.notna(row[gold_col]):
+                if abs(row[gold_col] - api_value) > SILVER_DAILY_TOLERANCE_C:
+                    differences.append(
+                        f"{row['location_id']}: {gold_col} {row[gold_col]} vs API "
+                        f"{api_col} {api_value}"
+                    )
+    return differences
+
+
 @asset_check(
     asset=gold_daily_temperature,
-    description="Validate Gold temperature: min <= avg <= max, no null keys, correct row count.",
+    description=(
+        "Validate Gold temperature: keys, row count, min <= avg <= max (errors); "
+        "complete local day and agreement with Silver daily (warnings)."
+    ),
 )
 def gold_temperature_check(context) -> AssetCheckResult:
     """Validate Gold daily temperature aggregations."""
@@ -283,45 +366,51 @@ def gold_temperature_check(context) -> AssetCheckResult:
         )
 
     df = pd.read_parquet(str(gold_file))
-    issues: list[str] = []
+    errors: list[str] = []
+    warnings: list[str] = []
 
     # Check one row per configured location
     expected_rows = len(load_locations_config())
     if len(df) != expected_rows:
-        issues.append(f"Row count {len(df)} != {expected_rows} configured locations")
+        errors.append(f"Row count {len(df)} != {expected_rows} configured locations")
 
     # Check no null keys
-    for key in ("location_id", "location_name"):
+    for key in ("location_id", "location_name", "date"):
         if key not in df.columns or df[key].isna().any():
-            issues.append(f"Null or missing {key} found")
-    if df["date"].isna().any():
-        issues.append("Null date found")
+            errors.append(f"Null or missing {key} found")
 
-    # Check temperature ordering: min <= avg <= max
+    # Check temperature ordering: min <= avg <= max (small float tolerance)
     for _, row in df.iterrows():
-        t_min = row.get("temp_min_c")
-        t_avg = row.get("temp_avg_c")
-        t_max = row.get("temp_max_c")
-        loc = row.get("location_name", "?")
-
+        t_min, t_avg, t_max = row.get("temp_min_c"), row.get("temp_avg_c"), row.get("temp_max_c")
+        loc = row.get("location_id", "?")
         if pd.notna(t_min) and pd.notna(t_avg) and pd.notna(t_max):
-            if not (t_min <= t_avg + 0.01):  # small tolerance for floating point
-                issues.append(f"{loc}: temp_min ({t_min}) > temp_avg ({t_avg})")
+            if not (t_min <= t_avg + 0.01):
+                errors.append(f"{loc}: temp_min ({t_min}) > temp_avg ({t_avg})")
             if not (t_avg <= t_max + 0.01):
-                issues.append(f"{loc}: temp_avg ({t_avg}) > temp_max ({t_max})")
+                errors.append(f"{loc}: temp_avg ({t_avg}) > temp_max ({t_max})")
 
-    passed = len(issues) == 0
+    # Complete local day (an edge partition may lack a neighbouring UTC day)
+    low, high = COMPLETE_DAY_HOURS
+    for _, row in df.iterrows():
+        hours = row.get("hours_covered")
+        if pd.isna(hours) or not low <= hours <= high:
+            warnings.append(f"{row['location_id']}: only {hours} hours of the local day")
 
+    warnings += _silver_daily_differences(df, partition_date_str)
+
+    issues = errors + warnings
     return AssetCheckResult(
-        passed=passed,
+        passed=not issues,
+        severity=AssetCheckSeverity.ERROR if errors else AssetCheckSeverity.WARN,
         metadata={
             "row_count": len(df),
-            "issues": issues if issues else ["All checks passed"],
+            "errors": errors,
+            "warnings": warnings,
             "partition_date": partition_date_str,
         },
         description=(
             f"Temperature checks passed ({len(df)} rows)"
-            if passed
+            if not issues
             else f"Issues: {'; '.join(issues)}"
         ),
     )

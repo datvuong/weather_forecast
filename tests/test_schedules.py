@@ -28,17 +28,29 @@ def _run_request(scheduled_time, schedule=hourly_weather_schedule):
 
 
 def test_schedule_targets_utc_date():
-    request = _run_request(datetime(2026, 10, 24, 14, 0, tzinfo=timezone.utc))
+    request, _ = _run_request(datetime(2026, 10, 24, 14, 0, tzinfo=timezone.utc))
 
     assert request.partition_key == "2026-10-24"
     assert request.run_key == "hourly_2026-10-24_14"
+    assert request.asset_selection is None  # the whole pipeline job
+
+
+def test_schedule_refreshes_previous_local_day_gold():
+    _, refresh = _run_request(datetime(2026, 10, 24, 14, 0, tzinfo=timezone.utc))
+
+    assert refresh.partition_key == "2026-10-23"
+    assert refresh.run_key == "gold_refresh_2026-10-23_14"
+    assert {k.to_user_string() for k in refresh.asset_selection} == {
+        "gold_daily_temperature",
+        "gold_daily_precipitation",
+    }
 
 
 def test_schedule_uses_utc_date_even_when_local_date_differs():
     # 00:30 on the 25th in Adelaide is still the 24th in UTC
     local = datetime(2026, 10, 25, 0, 30, tzinfo=ZoneInfo("Australia/Adelaide"))
 
-    request = _run_request(local)
+    request, _ = _run_request(local)
 
     assert request.partition_key == "2026-10-24"
 
