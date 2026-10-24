@@ -42,7 +42,6 @@ Create the full directory layout:
 ```
 weather_forecast/
 ├── pyproject.toml
-├── setup.cfg
 ├── dagster.yaml
 ├── README.md
 ├── .gitignore

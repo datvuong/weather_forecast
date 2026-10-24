@@ -46,8 +46,12 @@ cd weather_forecast
 
 python3 -m venv .venv
 source .venv/bin/activate          # run this in every new terminal
-pip install -e ".[dev]"
+pip install -e ".[dev]" -c constraints.txt
 ```
+
+`constraints.txt` pins the dependency versions the test suite passed with, so your install matches
+the tested one. Without `-c constraints.txt` pip picks the newest releases, which may not have been
+tested yet.
 
 Check the installation; both commands should succeed:
 
@@ -414,6 +418,8 @@ JOIN gold_daily_precipitation p USING (location_id, date);
 | `gold_temperature_check` warns `only N hours of the local day` | A neighbouring UTC day isn't loaded yet (e.g. the first day of the range) | Load the neighbouring day; the warning clears on the next run |
 | `dim_location_check` warns about missing grid data | A newly added city has no Bronze data yet | Run `weather_pipeline_job` for it once |
 | `IOException: Could not set lock on file … weather.duckdb` | Another process (e.g. your Python session) holds DuckDB open for writing | Close it and open the warehouse with `read_only=True`; jobs retry for ~10 s |
+| `dagster dev` warns `Found a dagster instance configuration value (dagster.yaml) … DAGSTER_HOME …` | `DAGSTER_HOME` is set, so `dagster.yaml` (run history in `.dagster_home/`, 4-run cap) is ignored | `unset DAGSTER_HOME` and restart `dagster dev` from the project folder |
+| `pip install` fails with `requires a different Python` | Python older than 3.10 | Install Python 3.10+ and recreate the venv with it |
 | `Address already in use` on start | Port 3000 is taken (maybe another `dagster dev`) | Stop the other one (`Ctrl+C` in its terminal) or use `dagster dev -p 3001` |
 
 ## 9. Stop and reset

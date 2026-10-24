@@ -29,6 +29,10 @@ End-to-end weather forecast data pipeline using **Medallion Architecture** built
 
 > New to the project? The **[User Guide](docs/user-guide.md)** walks through configuration, first run, backfill, schedules, checking results and troubleshooting.
 
+Requirements: **Python 3.10+** (`python3 --version`) on Linux or macOS. On **Windows, use WSL2**: native
+Windows isn't supported, because the atomic Parquet writes (`os.replace`) fail there while another run
+has the file open.
+
 ```bash
 # Clone the repository
 git clone https://github.com/datvuong/weather_forecast.git
@@ -38,12 +42,20 @@ cd weather_forecast
 python3 -m venv .venv
 source .venv/bin/activate
 
-# Install dependencies
-pip install -e ".[dev]"
+# Install dependencies at the versions the test suite passed with (constraints.txt)
+pip install -e ".[dev]" -c constraints.txt
 
-# Launch Dagster (UI available at http://localhost:3000)
+# Check the install: both should succeed
+dagster definitions validate
+pytest -q
+
+# Launch Dagster from the project folder (UI available at http://localhost:3000)
 dagster dev
 ```
+
+Start `dagster dev` from the project folder with `DAGSTER_HOME` unset. Only then does Dagster use
+`dagster.yaml` (persistent run history in `.dagster_home/` and the 4-run concurrency cap). With
+`DAGSTER_HOME` set elsewhere it logs a warning and ignores the file.
 
 ## Configuration
 
@@ -210,6 +222,7 @@ ruff check .              # Lint
 | `tests/test_warehouse.py` | DuckDB views and joins, name fallback for old files, fan-out check, job wiring |
 | `tests/test_duckdb_resource.py` | DuckDB queries and writer-lock retries |
 | `tests/test_schedules.py` | Schedules target the UTC partition, job selections, current cadence, API budget, Definitions load |
+| `tests/test_project_files.py` | `constraints.txt` pins every `pyproject.toml` dependency within its bounds, for the running Python |
 
 Asset tests run through Dagster's `materialize()` with a fake API client. Shared fixtures live
 in `tests/conftest.py`. The `data_dir` fixture points the pipeline at a temp directory via the

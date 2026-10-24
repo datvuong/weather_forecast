@@ -27,7 +27,8 @@ This is an **end-to-end weather forecast data pipeline** using **Medallion Archi
 
 ```
 weather_forecast/
-├── pyproject.toml                  # Dependencies and project metadata
+├── pyproject.toml                  # Dependencies and project metadata (the only packaging config)
+├── constraints.txt                 # Tested dependency versions for reproducible installs
 ├── dagster.yaml                    # Dagster instance configuration
 ├── config/
 │   ├── locations.yaml              # Configurable list of cities to track (id, attributes)
@@ -84,8 +85,8 @@ All work, by humans or agents, follows the plan in `docs/implementation-plan.md`
 python3 -m venv .venv
 source .venv/bin/activate
 
-# Install in development mode
-pip install -e ".[dev]"
+# Install in development mode, at the tested dependency versions
+pip install -e ".[dev]" -c constraints.txt
 
 # Launch Dagster dev server (UI at http://localhost:3000)
 dagster dev
@@ -200,4 +201,6 @@ No code changes are needed: Bronze requests it, and Silver adds it as a column w
 - Jobs use the **in-process executor** (steps are sub-second; a process per step only costs memory), and `dagster.yaml` caps **4 concurrent runs**. Every Parquet write goes through `write_parquet()` (atomic temp-file + rename), because concurrent runs read each other's files
 - Assets in `weather_pipeline_job` must not depend on assets outside it (e.g. current weather), or every backfill warns "Upstream data missing"; a test enforces this
 - Config changes go in **YAML files**, not Python code
+- Packaging config lives only in `pyproject.toml` (no `setup.cfg`). A dependency added there also needs a tested pin in `constraints.txt` (`tests/test_project_files.py` enforces it). Python 3.10 and 3.11+ resolve to different releases (e.g. pandas 2 vs 3, duckdb 1 vs 2), so those packages have one pin per Python range; regenerate the file as its header describes and test both ranges
+- Supported platforms: Linux, macOS and WSL2, Python 3.10+. Native Windows isn't supported (`os.replace` fails while another run has the file open)
 - Weather variable nulls are **preserved** (e.g., UV index is null at night)
