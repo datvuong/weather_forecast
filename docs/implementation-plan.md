@@ -25,8 +25,9 @@ flowchart LR
     P5["Phase 5<br/>Gold Layer"]
     P6["Phase 6<br/>Scheduling<br/>& Backfill"]
     P7["Phase 7<br/>Quality Checks<br/>& Testing"]
+    P8["Phase 8<br/>Dynamic Variables<br/>Hourly · Daily · Current"]
 
-    P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7
+    P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7 --> P8
 ```
 
 ---
@@ -706,6 +707,302 @@ def test_bronze_forecast_creates_parquet(tmp_path, mock_api_response):
     assert (tmp_path / "bronze" / "Melbourne" / "2026-10-24.parquet").exists()
     assert (tmp_path / "bronze" / "Adelaide" / "2026-10-24.parquet").exists()
 ```
+
+---
+
+## Phase 8: Dynamic Open-Meteo Variables — Hourly, Daily & Current
+
+> [!IMPORTANT]
+> **Status: approved 2026-10-24 (D1–D4).** Tracked in story **#15** and its sub-issues #16–#21 (§8.12).
+
+### 8.1 — Problem
+
+`config/variables.yaml` is meant to be dynamic ("add variables without code changes"), but the current design only partly supports this:
+
+| Area | Current limitation |
+|---|---|
+| `OpenMeteoClient` (`resources/api_client.py`) | `fetch_forecast()` / `fetch_historical()` have a fixed signature: `hourly_variables` plus three hard-coded unit kwargs. Other API parameters (`models`, `cell_selection`, `past_days`, `elevation`, …) can't be passed |
+| Request sections | Only `hourly` is supported. Open-Meteo's **`daily`** aggregates (e.g. `temperature_2m_max`, `sunrise`, `precipitation_sum`) and **`current`** conditions aren't modelled at all |
+| Archive variable filtering | `precipitation_probability` is hard-coded as "forecast-only". Every other variable the archive lacks (e.g. `uv_index`) slips through unnoticed |
+| Error handling | An invalid variable name returns HTTP 400. The client retries it 3× with backoff, then raises without Open-Meteo's `reason` |
+| Silver (`assets/silver.py`, `models/weather.py`) | `WEATHER_COLUMNS`, `VALUE_RANGES` and `HourlyWeatherRecord` hard-code the 8 initial variables. **A variable added to the YAML is fetched into Bronze but silently dropped in Silver** |
+| Types | Silver forces every variable to `float64`. Open-Meteo also returns time-valued variables (`sunrise`, `sunset`: `iso8601`/`unixtime` units) and codes (`weather_code`, `is_day`) |
+| Gold (`assets/gold.py`) | SQL references specific columns, and output names assume metric units (`_c`, `_kmh`). Removing `temperature_2m` from the YAML, or switching to `fahrenheit`, breaks it silently or mislabels values |
+
+### 8.2 — Verified API behaviour (probed 2026-10-24)
+
+| Behaviour | Result | Design consequence |
+|---|---|---|
+| Unsupported variable on an endpoint (e.g. archive + `uv_index` / `precipitation_probability`) | HTTP 200, unit `"undefined"`, all values `null` | Detect unsupported variables from `*_units`; drop the hard-coded filter |
+| Unknown variable name | HTTP 400 `{"error": true, "reason": "…"}` | Fail fast on 4xx (except 429) and surface `reason` |
+| `daily` aggregation window | Follows the request `timezone` (defaults to GMT) | With today's `timezone=GMT`, "daily max" would be a **UTC-day** max (10:30–10:30 in Adelaide) → see **D1** |
+| `timeformat=unixtime` + `timezone=Australia/Adelaide` | Hourly `time` = exact UTC epoch seconds; daily `time` = epoch of **local** midnight; `utc_offset_seconds` = 37800 | Gives DST-safe UTC hourly timestamps *and* local-day daily rows from one call |
+| `current` on the forecast API | `{"time", "interval": 900, <vars>}`: one 15-min snapshot | Not reproducible for past dates → append-only snapshots (**D3**) |
+| `current` on the archive API | Silently ignored | Never send `current` to the archive |
+| Daily on the archive API | Supported (`temperature_2m_max`, `precipitation_sum`, `sunrise`, …) | Backfill works for daily too |
+| Value types | `sunrise` → time string/epoch; `weather_code` → WMO code; `daylight_duration` → seconds | Silver dtype derived from units, not assumed `float64` |
+
+### 8.3 — Configuration schema (`config/variables.yaml`)
+
+Backward-compatible: `hourly_variables` keeps its name, and two optional sections are added (**D4 — approved**). Each variable can declare an optional `valid_range` that the Silver quality check uses, replacing the hard-coded `VALUE_RANGES`.
+
+```yaml
+hourly_variables:
+  - name: temperature_2m
+    description: "Air temperature at 2 meters above ground"
+    unit: "°C"
+    valid_range: [-60, 65]        # optional — used by silver quality checks
+  - name: cloud_cover             # any Open-Meteo hourly variable, no code change
+    description: "Total cloud cover"
+    unit: "%"
+    valid_range: [0, 100]
+
+daily_variables:                  # NEW — Open-Meteo daily aggregates (local calendar day)
+  - name: temperature_2m_max
+    description: "Maximum daily air temperature"
+    unit: "°C"
+  - name: sunrise
+    description: "Sunrise time"
+    unit: "iso8601"
+
+current_variables:                # NEW — 15-minute "current conditions" snapshot
+  - name: temperature_2m
+    description: "Current air temperature"
+    unit: "°C"
+  - name: weather_code
+    description: "WMO weather code"
+    unit: "wmo code"
+
+settings:
+  temperature_unit: celsius       # validated: celsius | fahrenheit
+  wind_speed_unit: kmh            # validated: kmh | ms | mph | kn
+  precipitation_unit: mm          # validated: mm | inch
+  forecast_days: 7
+  backfill_days: 30
+  current_interval_minutes: 15    # NEW — current-weather poll cadence: 15 | 30 | 60 (D3b)
+  extra_params: {}                # NEW — passthrough, e.g. {models: best_match, cell_selection: land}
+```
+
+Model changes (`models/weather.py`):
+- `VariableDefinition.valid_range: tuple[float, float] | None`
+- `VariablesConfig.daily_variables` / `current_variables` (default `[]`), with `hourly_names` / `daily_names` / `current_names` properties (`variable_names` is kept as an alias for hourly)
+- `APISettings` units become `Literal[...]`; add `extra_params: dict[str, str | int | float | bool]`, rejecting keys the pipeline controls (`latitude`, `longitude`, `hourly`, `daily`, `current`, `timezone`, `timeformat`, `start_date`, `end_date`, `forecast_days`, `past_days`)
+- Duplicate variable names within a section → validation error
+
+### 8.4 — Generic `OpenMeteoClient`
+
+Replace the two fixed-signature methods with one request model and one fetch method. The client knows nothing about specific variables.
+
+```python
+class OpenMeteoRequest(BaseModel):
+    latitude: float
+    longitude: float
+    hourly: list[str] = []
+    daily: list[str] = []
+    current: list[str] = []
+    timezone: str = "GMT"
+    start_date: date | None = None          # mutually exclusive with forecast_days/past_days
+    end_date: date | None = None
+    forecast_days: int | None = None
+    past_days: int | None = None
+    params: dict[str, str | int | float | bool] = {}   # units + extra_params
+
+    def to_query(self, endpoint: Literal["forecast", "archive"]) -> dict:
+        # comma-join non-empty sections; always timeformat=unixtime;
+        # drop `current` (and forecast_days/past_days) for archive
+
+class OpenMeteoClient(ConfigurableResource):
+    base_url: str = "https://api.open-meteo.com/v1/forecast"
+    archive_url: str = "https://archive-api.open-meteo.com/v1/archive"
+
+    def fetch(self, endpoint: Literal["forecast", "archive"], request: OpenMeteoRequest) -> dict: ...
+
+def unsupported_variables(response: dict) -> dict[str, list[str]]:
+    """{'hourly': ['uv_index'], ...} — variables whose unit is 'undefined'."""
+```
+
+Error handling:
+- Retry only on timeouts, connection errors, 429 and 5xx. Any other 4xx raises immediately with `OpenMeteoAPIError(status, reason)`.
+- A 200 body with `"error": true` also raises `OpenMeteoAPIError`.
+
+### 8.5 — Timezone strategy (**D1 — approved: option B**)
+
+| Option | Hourly | Daily | Notes |
+|---|---|---|---|
+| A. Keep `timezone=GMT` | UTC ✔ | Aggregated over **UTC** days ✘ | Simplest, but daily values are misleading for non-UTC cities |
+| **B. Location timezone + `timeformat=unixtime` (approved)** | Exact UTC epochs ✔ (DST-safe) | Aggregated over **local** calendar days ✔ | One call per location still returns both sections |
+
+How option B fits the existing UTC partitions:
+- A UTC day `d` spans local dates `d-1..d+1` for any UTC offset. Bronze requests `start_date=d-1, end_date=d+1` in the location's timezone.
+- Silver keeps hourly rows whose **UTC** date is `d`, and the daily row whose **local** date is `d`.
+- For today's partition the forecast request uses `past_days=1` + `forecast_days`, so the early UTC hours of today are included.
+- Silver's `utc_offset_seconds != 0` guard is replaced: hourly times are epochs, and the daily date = `time + utc_offset_seconds`.
+
+### 8.6 — Bronze changes
+
+| Asset | Change |
+|---|---|
+| `bronze_forecast` (rename to `bronze_weather`?) | One request per location with `hourly` + `daily` from config (option B window). Raw JSON stored unchanged. Output metadata adds `unsupported_variables` per location. The archive-empty fallback checks hourly *and* daily |
+| **`bronze_current`** (new, **D3**) | See §8.8 |
+
+Hourly/daily Bronze layout is unchanged: `data/bronze/{location}/{date}.parquet`.
+
+### 8.7 — Silver: dynamic schema (**D2 — approved: option A**)
+
+| Option | Shape | Pros | Cons |
+|---|---|---|---|
+| **A. Wide, columns from config (approved)** | Fixed keys + one column per configured variable | Matches existing Gold SQL; analyst-friendly | Schema changes when config changes, so reads use `read_parquet(..., union_by_name=true)` |
+| B. Long / EAV | `location, timestamp, variable, value, unit` | Never changes schema | Time-valued variables don't fit a numeric `value`; every Gold query needs a pivot |
+
+With option A:
+- **Layout:** `data/silver/hourly/{date}.parquet` (moved from `data/silver/{date}.parquet`), `data/silver/daily/{date}.parquet` and `data/silver/current/{date}.parquet`.
+- **Dtypes** come from the response units: `unixtime`/`iso8601` → `timestamp[UTC]`, everything else → `float64` (codes stay float so nulls are preserved).
+- **Validation:** the fixed `HourlyWeatherRecord` is replaced by Pydantic models built at runtime from the config (`pydantic.create_model`), one per section. Every record is still validated.
+- **Unsupported or missing variables** become all-null columns (the column always exists for configured variables). Null % and the unsupported list go into metadata.
+
+| Asset | Keys | Notes |
+|---|---|---|
+| `silver_hourly_weather` | `location_name, timestamp_utc, timestamp_local` | Dynamic hourly columns |
+| **`silver_daily_weather`** (new) | `location_name, date_local` | One row per location per partition; dynamic daily columns |
+| **`silver_current_weather`** (new, **D3**) | `location_name, observed_at_utc` | See §8.8 |
+
+Quality checks become config-driven:
+- `silver_quality_check` checks ranges against `valid_range` per variable and keeps its row-count and duplicate checks.
+- New `silver_daily_check`: one row per location.
+- Current-weather checks: see §8.8.
+
+### 8.8 — Current weather design (**D3 — approved: B + C, 15-min cadence**)
+
+#### What Open-Meteo's `current` actually is
+
+| Fact | Evidence (probed 2026-10-24) | Implication |
+|---|---|---|
+| A **model value** for the current 15-minute slot, **not a station observation** | `current` at `09:45` matched the `minutely_15` series at `09:45` exactly, for Adelaide and Berlin (temperature and wind) | It's the latest nowcast, not ground truth. The archive (reanalysis) supersedes it for history |
+| Refreshes every **15 minutes** | `"interval": 900`; `time` is aligned to :00/:15/:30/:45 | Polling more often than every 15 min returns the same snapshot |
+| **Forecast endpoint only**; can't be requested for a past time | The archive silently ignores `current` | A missed poll is a **permanent gap**; Dagster backfills can't recreate it |
+| Real 15-min resolution in Australia (not a straight interpolation of the hourly series) | Adelaide wind 9.4 → 9.8 → 10.0 → 10.0 → 9.6 across 09:00–10:00 | Captures some intra-hour variation that hourly rows miss |
+
+It therefore fits the batch, partitioned Medallion model poorly in two ways:
+- **Re-running a partition can't reproduce it.** Dagster normally assumes that materializing a partition again gives the same result.
+- **It accumulates during the day** (a series of snapshots) instead of arriving as one complete day.
+
+#### Options
+
+| Option | What you get | Pros | Cons |
+|---|---|---|---|
+| A. Don't ingest `current` | Nothing. `current_variables` stays unused/removed | Zero complexity; hourly + archive already cover history | No "conditions right now" view; config section unused |
+| B. **Snapshot history** | Every polled snapshot kept: a 15-min "as-reported" time series per location | Full history of what the pipeline saw; supports nowcast-vs-forecast comparisons later | Not backfillable; gaps are permanent; many small Bronze files |
+| C. **Latest conditions only** | One row per location: the most recent snapshot, overwritten each poll | Simplest consumer view for dashboards; no partition semantics to bend | No history; the previous value is lost on every poll |
+| **B + C (recommended)** | B's history in Bronze/Silver, plus C as a Gold "latest" table | History and a ready-to-query "now" view; C is a cheap query over B | The most moving parts of the three (3 assets + 1 job/schedule) |
+
+> Alternative for later, not part of D3: because `current` equals the `minutely_15` value for that slot, a **reproducible, backfillable** 15-min history could instead come from the `minutely_15` section (requested by date like hourly). Its past values reflect the newest model runs rather than what was reported at the time. This would be a separate story if wanted.
+
+#### Approved design (B + C)
+
+**Assets**
+
+| Asset | Partitioned | Storage | Behaviour |
+|---|---|---|---|
+| `bronze_current` | Daily (UTC) | `data/bronze/current/{location}/{date}/{HHMM}.parquet` (raw JSON + metadata, like Bronze) | Calls the forecast endpoint with only `current=<current_variables>`. **The file is named after the observation time `current.time`, not the run time,** so a re-run in the same 15-min slot overwrites the same file and stays idempotent. For a partition other than today (UTC) it writes nothing, logs a warning and records `snapshots_written: 0` (this past-date guard is why the asset is safe if someone runs a backfill that includes it) |
+| `silver_current_weather` | Daily (UTC) | `data/silver/current/{date}.parquet` | Rebuilds the day from **all** Bronze snapshot files, so it's idempotent. Columns: `location_name, observed_at_utc, observed_at_local, interval_seconds, <current_variables…>, ingestion_timestamp`. Dynamic columns and dtypes as in §8.7. Dedup on `(location_name, observed_at_utc)`, keeping the latest ingestion. Also **compacts** the day's small Bronze files into one Parquet |
+| `gold_current_conditions` | **Not partitioned** | DuckDB table `gold_current_conditions` + `data/gold/current_conditions/latest.parquet` (both overwritten) | Latest snapshot per location from today's Silver (plus yesterday's, for the first minutes after UTC midnight), with `age_minutes` |
+
+**Job & schedule.** Kept separate from the hourly pipeline:
+- `current_weather_job` selects only the three current assets.
+- `weather_pipeline_job` explicitly **excludes** them, so historical backfills never touch current weather.
+- `current_weather_schedule` builds its cron from a new setting `settings.current_interval_minutes` (allowed: `15 | 30 | 60`; see **D3b**) and targets today's UTC partition.
+- Current uses its own API call rather than adding `current=` to the hourly/daily call. The two run at different cadences, and the hourly asset also runs for past dates, where `current` makes no sense.
+
+**Quality checks**
+- `silver_current_check`: no duplicate `(location, observed_at_utc)`; values within `valid_range`.
+- `gold_current_freshness_check`: every configured location has a snapshot no older than `2 × current_interval_minutes`. This surfaces a stopped scheduler or a failing API quickly.
+
+**API budget** (free tier: 10,000 calls/day)
+
+| Cadence | Calls/location/day (24 hourly-pipeline + current) | Max locations |
+|---|---|---|
+| 15 min | 24 + 96 = 120 | ~83 |
+| 30 min | 24 + 48 = 72 | ~138 |
+| 60 min | 24 + 24 = 48 | ~208 |
+
+Config validation logs a warning when `locations × calls/day` exceeds 80% of the daily limit.
+
+**Known limitations (documented in README/AGENTS.md)**
+- Gaps are permanent: snapshots missed while Dagster is stopped can't be recovered.
+- At a 15-min cadence Bronze gains 96 small files per location per day. Silver compacts them daily; Bronze retention/compaction is out of scope.
+- Values are model nowcasts; for verified history use the archive-backed hourly data.
+
+**Tests**
+- `bronze_current`:
+  - file named after `current.time`
+  - a re-run in the same slot overwrites the file instead of adding one
+  - a past partition writes nothing
+- `silver_current_weather`: rebuilds from multiple snapshots; dedups; dynamic columns
+- `gold_current_conditions`: picks the latest per location across the UTC midnight boundary
+- Freshness check: fails when the snapshot is stale
+- Schedule:
+  - cron derived from `current_interval_minutes`
+  - `weather_pipeline_job` excludes the current assets
+  - invalid interval rejected
+
+#### Sub-decisions
+
+| # | Question | Options | Recommendation |
+|---|---|---|---|
+| **D3a** | Scope | A (skip) / B (history) / C (latest only) / **B + C** | **B + C** |
+| **D3b** | Default poll cadence | **15 min** (matches API refresh, ~83-location ceiling) / 30 min / 60 min (fewest files, rides the hourly cadence) | **15 min**, configurable |
+
+### 8.9 — Gold safeguards
+
+Gold keeps computing from hourly Silver (no new Gold metrics in this phase).
+- Each Gold asset declares `REQUIRED_HOURLY_VARIABLES`. A helper checks these against the config **when the definitions load**, so removing e.g. `temperature_2m` gives a clear error instead of broken SQL.
+- Gold output names assume metric units, so the same validation rejects non-metric `settings` units, until unit-neutral Gold naming is designed (out of scope).
+- Gold reads `data/silver/hourly/`.
+
+### 8.10 — Definitions, schedule & docs
+
+- Register `silver_daily_weather` and its check in `weather_pipeline_job` (the job selects by group, so the hourly schedule picks it up automatically).
+- Current weather (subject to D3): register `bronze_current`, `silver_current_weather`, `gold_current_conditions`, their checks, `current_weather_job` and `current_weather_schedule`. Exclude the current assets from `weather_pipeline_job` (§8.8).
+- **AGENTS.md / README:** replace "the Silver Pydantic model may need updating" with "no code change needed". Document the three sections, `valid_range`, `extra_params` and the timezone strategy.
+
+### 8.11 — Tests
+
+| File | Cases |
+|---|---|
+| `test_models.py` | New sections default to empty; `valid_range` parsing; unit `Literal` validation; reserved `extra_params` keys rejected; duplicate names rejected |
+| `test_api_client.py` | `to_query` per endpoint (sections comma-joined, empty sections omitted, `current` dropped for archive, `timeformat=unixtime`); 400 → immediate `OpenMeteoAPIError` with `reason`, no retry; 429/5xx retried; `unsupported_variables()` |
+| `test_assets_bronze.py` | Option B date window (`d-1..d+1`, `past_days=1` for today); hourly + daily in one call; `bronze_current` cases in §8.8 |
+| `test_assets_silver.py` | **An extra configured variable (`cloud_cover`) appears in Silver with no code change**; time-valued daily variable typed as timestamp; unsupported variable → null column; UTC filtering across the Adelaide DST start (2026-10-04); daily row = local date; current cases in §8.8 |
+| `test_assets_gold.py` | Missing required variable / non-metric units → load-time error; reads the new hourly path |
+
+Fixtures: a temp `variables.yaml` fixture (the loaders are `lru_cache`d, so tests clear the cache) and API response builders for `daily`/`current` in `unixtime` format.
+
+### 8.12 — Tracking & delivery (per AGENTS.md workflow)
+
+Story **#15 `[Story] Phase 8: Dynamic Open-Meteo variables — hourly, daily & current`**, with sub-issues and one commit each:
+
+| # | Issue | Scope | Est. |
+|---|---|---|---|
+| 8.1 (#16) | `[Task]` Config schema for hourly/daily/current, `valid_range`, `extra_params` | §8.3 + tests | 45 min |
+| 8.2 (#17) | `[Task]` Generic `OpenMeteoClient` request model and 4xx handling | §8.4 + tests | 1 h |
+| 8.3 (#18) | `[Task]` Bronze: local-timezone unixtime window, hourly + daily in one call | §8.5–8.6 + tests | 1 h |
+| 8.4 (#19) | `[Task]` Silver: dynamic hourly schema + `silver_daily_weather` | §8.7 + tests | 1.5 h |
+| 8.5 (#20) | `[Task]` Current weather: `bronze_current`, `silver_current_weather`, `gold_current_conditions`, job/schedule, checks | §8.8 + tests | 1.5 h |
+| 8.6 (#21) | `[Task]` Gold required-variable/unit validation, wiring, docs | §8.9–8.10 + tests | 45 min |
+
+**Total: ~6.5 hours.** Order: 8.1 → 8.2 → 8.3 → 8.4 → (8.5 ∥ 8.6).
+
+### 8.13 — Decisions
+
+| # | Decision | Outcome |
+|---|---|---|
+| **D1** | Request timezone for hourly + daily | ✅ Approved: **B**, location timezone + `timeformat=unixtime` |
+| **D2** | Silver shape for dynamic variables | ✅ Approved: **A**, wide, columns from config, `union_by_name` reads |
+| **D3a** | Current weather scope | ✅ Approved: **B + C**, snapshot history + latest-conditions table (§8.8) |
+| **D3b** | Current poll cadence | ✅ Approved: **15 min**, configurable (`settings.current_interval_minutes`) |
+| **D4** | Config keys | ✅ Approved: keep `hourly_variables`, add `daily_variables` / `current_variables` |
+
+Out of scope (candidates for later stories): `minutely_15` data (the client design supports it, but no assets), multi-location batching (Open-Meteo accepts comma-separated coordinates), Gold metrics built from API daily aggregates, unit-neutral Gold column names.
 
 ---
 
