@@ -11,6 +11,7 @@ from weather_forecast.assets.gold import (
     gold_daily_precipitation,
     gold_daily_temperature,
     gold_temperature_check,
+    validate_gold_requirements,
 )
 from weather_forecast.assets.silver import section_columns, silver_hourly_weather, silver_path
 from weather_forecast.utils.helpers import load_variables_config
@@ -129,3 +130,38 @@ def test_missing_silver_skips_without_failing(data_dir, duckdb_resource, past_da
     assert not (data_dir / "gold" / "daily_temperature").exists()
     [evaluation] = result.get_asset_check_evaluations()
     assert not evaluation.passed
+
+
+class TestGoldRequirements:
+    def test_project_config_is_valid(self):
+        validate_gold_requirements(load_variables_config())
+
+    def test_extra_variables_are_fine(self, variables_config):
+        config = load_variables_config()
+        hourly = [v.model_dump() for v in config.hourly_variables]
+        hourly.append({"name": "cloud_cover", "description": "c", "unit": "%"})
+
+        validate_gold_requirements(variables_config(hourly_variables=hourly))
+
+    def test_missing_required_variable(self, variables_config):
+        hourly = [
+            v.model_dump()
+            for v in load_variables_config().hourly_variables
+            if v.name not in ("temperature_2m", "precipitation_probability")
+        ]
+        config = variables_config(hourly_variables=hourly)
+
+        with pytest.raises(ValueError) as exc_info:
+            validate_gold_requirements(config)
+
+        message = str(exc_info.value)
+        assert "gold_daily_temperature needs hourly variables ['temperature_2m']" in message
+        assert "gold_daily_precipitation needs hourly variables" in message
+
+    def test_non_metric_units(self, variables_config):
+        settings = load_variables_config().settings.model_dump()
+        settings.update(temperature_unit="fahrenheit", wind_speed_unit="mph")
+        config = variables_config(settings=settings)
+
+        with pytest.raises(ValueError, match="temperature_unit='celsius', got 'fahrenheit'"):
+            validate_gold_requirements(config)

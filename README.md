@@ -5,12 +5,13 @@ End-to-end weather forecast data pipeline using **Medallion Architecture** built
 ## Features
 
 - 🥉 **Bronze Layer** — Raw weather data ingested from Open-Meteo API
-- 🥈 **Silver Layer** — Cleaned, validated, and typed hourly weather records
+- 🥈 **Silver Layer** — Cleaned, validated, and typed hourly and daily records, with one column per configured variable
 - 🥇 **Gold Layer** — Daily temperature trends and precipitation summaries
-- ⏰ **Hourly scheduling** — Automatic data refresh via Dagster
+- 🌡️ **Current conditions** — 15-minute snapshot history plus a "latest conditions" table
+- ⏰ **Scheduling** — Hourly pipeline refresh plus a 15-minute current-weather poll via Dagster
 - 📊 **DuckDB analytics** — Fast local queries on aggregated data
 - ✅ **Data quality checks** — Built-in asset checks at every layer
-- 🔧 **Configurable** — Add locations and variables via YAML files
+- 🔧 **Configurable** — Add locations and any Open-Meteo hourly/daily/current variable via YAML, with no code changes
 
 ## Tech Stack
 
@@ -59,7 +60,42 @@ locations:
 
 ### Weather Variables (`config/variables.yaml`)
 
-Tracks: temperature, humidity, precipitation, precipitation probability, wind speed, wind direction, wind gusts, and UV index.
+Three request sections, each a list of [Open-Meteo variables](https://open-meteo.com/en/docs):
+
+| Section | What it is | Silver table |
+|---|---|---|
+| `hourly_variables` | Hourly time series | `data/silver/hourly/{date}.parquet` |
+| `daily_variables` | Daily aggregates over each location's **local** calendar day | `data/silver/daily/{date}.parquet` |
+| `current_variables` | 15-minute "current conditions" snapshots (forecast API only) | `data/silver/current/{date}.parquet` |
+
+```yaml
+hourly_variables:
+  - name: cloud_cover          # any Open-Meteo hourly variable
+    description: "Total cloud cover"
+    unit: "%"
+    valid_range: [0, 100]      # optional, enforced by the Silver quality checks
+
+daily_variables:
+  - name: sunrise              # time-valued variables ("iso8601"/"unixtime") become UTC timestamps
+    description: "Sunrise time"
+    unit: "iso8601"
+
+settings:
+  temperature_unit: celsius    # celsius | fahrenheit   (Gold requires celsius)
+  wind_speed_unit: kmh         # kmh | ms | mph | kn    (Gold requires kmh)
+  precipitation_unit: mm       # mm | inch              (Gold requires mm)
+  forecast_days: 7
+  backfill_days: 30
+  current_interval_minutes: 15 # 15 | 30 | 60
+  extra_params: {}             # any other API parameter, e.g. {models: best_match}
+```
+
+Adding a variable needs no code change: it becomes a Silver column on the next run. Variables
+an endpoint doesn't provide (e.g. `precipitation_probability` from the archive) are kept as
+null columns and listed in the asset metadata. An invalid variable name fails the run with
+Open-Meteo's error message. The Gold assets need `temperature_2m`, `relative_humidity_2m`,
+`wind_speed_10m`, `uv_index`, `precipitation` and `precipitation_probability` with metric
+units; Dagster refuses to load the definitions if they're missing.
 
 ## Architecture
 
@@ -77,13 +113,37 @@ Open-Meteo API
 
 ## Scheduling
 
-`hourly_weather_schedule` runs `weather_pipeline_job` (Bronze → Silver → Gold) every hour at `:00` UTC
-for **today's UTC partition**, refreshing the latest forecast. Turn it on under
-**Overview → Schedules** in the Dagster UI (schedules start stopped).
+| Schedule | Job | Cadence | What it does |
+|---|---|---|---|
+| `hourly_weather_schedule` | `weather_pipeline_job` | every hour at `:00` UTC | Bronze → Silver (hourly + daily) → Gold for **today's UTC partition**, refreshing the latest forecast |
+| `current_weather_schedule` | `current_weather_job` | every `current_interval_minutes` (default 15) | Snapshot of current conditions → Silver history → `gold_current_conditions` |
+
+Turn them on under **Overview → Schedules** in the Dagster UI (schedules start stopped).
 
 Partitions are **UTC calendar days**: in Adelaide (UTC+10:30) the `2026-10-24` partition covers
-10:30 on the 24th to 09:30 on the 25th, local time. Each Silver row has both
-`timestamp_utc` and `timestamp_local`.
+10:30 on the 24th to 09:30 on the 25th, local time. Each hourly Silver row has both
+`timestamp_utc` and `timestamp_local`. Hourly values are on the location's local whole hours,
+so for half-hour-offset timezones like Adelaide they fall at `:30` UTC. Daily rows cover the
+location's local calendar day equal to the partition date.
+
+## Current Weather
+
+Open-Meteo's `current` values are model nowcasts for the current 15-minute slot, not station
+observations, and they can't be requested for a past time. So:
+
+- `bronze_current` stores one snapshot per poll at
+  `data/bronze/current/{location}/{date}/{HHMM}.parquet`, named by observation time. A re-run in
+  the same slot overwrites the same file. It only runs for today's UTC partition.
+- `silver_current_weather` rebuilds the day's history from all snapshots into one file.
+- `gold_current_conditions` (DuckDB table + `data/gold/current_conditions/latest.parquet`) holds
+  the latest snapshot per location with its `age_minutes`.
+- `gold_current_freshness_check` fails if a location's latest snapshot is older than twice the
+  poll interval (e.g. the scheduler stopped).
+
+Snapshots missed while Dagster isn't running are **permanent gaps**. For verified history, use
+the archive-backed hourly data. API budget (free tier: 10,000 calls/day): each location needs 24
+hourly-pipeline calls plus 96 current polls/day at 15 minutes, so ~83 locations fit. Dagster
+logs a warning above 80% of the limit.
 
 ## Historical Backfill
 
@@ -97,7 +157,8 @@ every layer:
    archive doesn't have yet fall back to the forecast API automatically
 
 > Materializing only `bronze_forecast` does **not** update Silver/Gold. Select all assets (or
-> use the job) so downstream layers run too.
+> use the job) so downstream layers run too. Current-weather assets aren't part of the job and
+> can't be backfilled.
 
 ## Testing
 
@@ -109,18 +170,20 @@ ruff check .              # Lint
 
 | Test file | Covers |
 |---|---|
-| `tests/test_models.py` | Pydantic config/domain models, YAML config loaders |
-| `tests/test_api_client.py` | Open-Meteo request params, retries and timeouts (HTTP mocked with `respx`) |
-| `tests/test_assets_bronze.py` | Endpoint selection, archive→forecast fallback, Bronze Parquet, file check |
-| `tests/test_assets_silver.py` | JSON parsing, UTC/local timestamps, validation, dedup, quality check |
-| `tests/test_assets_gold.py` | Daily aggregations, DuckDB upsert idempotency, temperature check |
+| `tests/test_models.py` | Config schema (sections, `valid_range`, units, `extra_params`), runtime Silver record models, YAML loaders |
+| `tests/test_api_client.py` | Request building per endpoint, unsupported-variable detection, fail-fast 4xx, retries (HTTP mocked with `respx`) |
+| `tests/test_assets_bronze.py` | Endpoint selection, location-timezone unixtime window, archive→forecast fallback, file check |
+| `tests/test_assets_silver.py` | Config-driven hourly/daily parsing, DST, new-variable-without-code-change, dedup, quality checks |
+| `tests/test_assets_current.py` | Snapshot files, same-slot idempotency, history rebuild, latest conditions, freshness |
+| `tests/test_assets_gold.py` | Daily aggregations, DuckDB upsert idempotency, temperature check, Gold config requirements |
 | `tests/test_duckdb_resource.py` | DuckDB queries and writer-lock retries |
-| `tests/test_schedules.py` | Hourly schedule targets the UTC partition; Definitions load |
+| `tests/test_schedules.py` | Schedules target the UTC partition, job selections, current cadence, API budget, Definitions load |
 
 Asset tests run through Dagster's `materialize()` with a fake API client. Shared fixtures live
 in `tests/conftest.py`. The `data_dir` fixture points the pipeline at a temp directory via the
-`WEATHER_FORECAST_DATA_DIR` environment variable, which you can also use to relocate the data
-lake outside tests.
+`WEATHER_FORECAST_DATA_DIR` environment variable, and `variables_config` writes a temporary
+`variables.yaml` via `WEATHER_FORECAST_CONFIG_DIR`. Both variables also work outside tests to
+relocate the data lake or config.
 
 ## Documentation
 

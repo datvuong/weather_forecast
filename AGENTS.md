@@ -18,9 +18,9 @@ This is an **end-to-end weather forecast data pipeline** using **Medallion Archi
 
 | Layer | Purpose | Storage |
 |---|---|---|
-| **Bronze** | Raw API responses preserved as-is | `data/bronze/{location}/{date}.parquet` |
-| **Silver** | Cleaned, typed, deduplicated hourly/daily records (columns from config) | `data/silver/{hourly,daily}/{date}.parquet` |
-| **Gold** | Aggregated daily summaries for analytics | `data/gold/{metric}/{date}.parquet` + `warehouse/weather.duckdb` |
+| **Bronze** | Raw API responses preserved as-is | `data/bronze/{location}/{date}.parquet` (hourly + daily), `data/bronze/current/{location}/{date}/{HHMM}.parquet` (snapshots) |
+| **Silver** | Cleaned, typed, deduplicated records, one column per configured variable | `data/silver/{hourly,daily,current}/{date}.parquet` |
+| **Gold** | Aggregated daily summaries + latest current conditions | `data/gold/{metric}/{date}.parquet`, `data/gold/current_conditions/latest.parquet` + `warehouse/weather.duckdb` |
 
 ## Project Structure
 
@@ -35,15 +35,16 @@ weather_forecast/
 │   ├── definitions.py              # Dagster entry point — wires assets, resources, schedules
 │   ├── assets/
 │   │   ├── bronze.py               # Bronze layer: raw API ingestion
-│   │   ├── silver.py               # Silver layer: cleaning and validation
-│   │   └── gold.py                 # Gold layer: daily aggregations
+│   │   ├── silver.py               # Silver layer: config-driven parsing and validation (hourly, daily)
+│   │   ├── current.py              # Current weather: snapshots → history → latest conditions
+│   │   └── gold.py                 # Gold layer: daily aggregations + config requirements
 │   ├── resources/
 │   │   ├── api_client.py           # Open-Meteo API wrapper (ConfigurableResource)
 │   │   └── duckdb_resource.py      # DuckDB connection manager (ConfigurableResource)
 │   ├── models/
 │   │   └── weather.py              # Pydantic schemas for API data and domain models
 │   ├── partitions.py               # DailyPartitionsDefinition
-│   ├── schedules.py                # Hourly schedule definition
+│   ├── schedules.py                # Jobs + hourly and current-weather schedules
 │   └── utils/
 │       └── helpers.py              # YAML config loaders and shared utilities
 ├── data/                           # Local data lake (git-ignored)
@@ -109,7 +110,7 @@ No code changes needed. The pipeline will automatically include the new location
 
 ## Adding a Weather Variable
 
-Edit `config/variables.yaml`:
+Edit `config/variables.yaml` under the matching section: `hourly_variables`, `daily_variables` or `current_variables`.
 
 ```yaml
 hourly_variables:
@@ -117,9 +118,16 @@ hourly_variables:
   - name: cloud_cover
     description: "Total cloud cover"
     unit: "%"
+    valid_range: [0, 100]   # optional: checked by the Silver quality checks
 ```
 
-> **Note:** The variable name must match an Open-Meteo API parameter. See https://open-meteo.com/en/docs for the full list. After adding a variable, the Silver layer Pydantic model (`models/weather.py`) may need updating to include the new field.
+No code changes are needed: Bronze requests it, and Silver adds it as a column with a Pydantic model built from the config. Notes:
+- The name must be a valid Open-Meteo parameter **for that section** (see https://open-meteo.com/en/docs). An invalid name fails the run with Open-Meteo's `reason`.
+- Variables an endpoint doesn't provide (unit `"undefined"`, e.g. `precipitation_probability` from the archive) become null columns and are listed in the asset metadata.
+- A `unit` of `iso8601`/`unixtime` marks a time-valued variable (e.g. `sunrise`), stored as a UTC timestamp. Everything else is `float64`.
+- Variable names must be unique within a section and must not clash with Silver key columns (`time`, `location_name`, `timestamp_utc`, …).
+- Other API parameters go in `settings.extra_params` (pipeline-controlled ones like `timezone` are rejected).
+- Gold needs certain hourly variables and metric units (`REQUIRED_HOURLY_VARIABLES` / `REQUIRED_UNITS` in `assets/gold.py`). The definitions fail to load if the config removes them.
 
 ## Dagster Concepts Used
 
@@ -128,25 +136,33 @@ hourly_variables:
 | **Software-Defined Assets** | `assets/*.py` | Each Medallion layer is a Dagster asset |
 | **ConfigurableResource** | `resources/*.py` | API client and DuckDB connections are injected resources |
 | **DailyPartitionsDefinition** | `partitions.py` | Each partition = one day of weather data |
-| **ScheduleDefinition** | `schedules.py` | Hourly cron triggers today's partition |
+| **Unpartitioned asset** | `assets/current.py` | `gold_current_conditions` is overwritten with the latest snapshot per location |
+| **Asset jobs + schedules** | `schedules.py` | `weather_pipeline_job` (hourly, backfillable) and `current_weather_job` (every `current_interval_minutes`) both target today's partition |
 | **Asset Checks** | `assets/*.py` | Data quality validation after each layer |
 
 ## API Details
 
+### Request strategy
+- `OpenMeteoClient.fetch(endpoint, OpenMeteoRequest)` is variable-agnostic: sections, window and params come from the request.
+- Bronze requests each location's **own timezone** with `timeformat=unixtime`. Hourly `time` values are exact UTC epochs, and daily rows are stamped with the epoch of local midnight.
+- UTC partition `d` spans local dates `d-1..d+1`, so that window is requested (today: `past_days=1` + forecast days).
+- Only transport errors, 429 and 5xx are retried. Other 4xx raise `OpenMeteoAPIError` with Open-Meteo's `reason`.
+
 ### Open-Meteo Forecast Endpoint
 - URL: `https://api.open-meteo.com/v1/forecast`
 - No authentication required
-- Returns JSON with `hourly.time[]` and variable arrays
+- Returns JSON with `hourly`/`daily` time arrays and `current` (a single 15-minute snapshot)
 
 ### Open-Meteo Archive Endpoint
 - URL: `https://archive-api.open-meteo.com/v1/archive`
 - Used for historical backfill (dates in the past)
-- `precipitation_probability` is NOT requested from the archive, and `uv_index` comes back null there; both are null in Silver for archive days
-- Lags real time: for days it doesn't have yet it returns HTTP 200 with null-filled arrays, so Bronze falls back to the forecast endpoint for that date
+- Unsupported variables (e.g. `precipitation_probability`, `uv_index`, `uv_index_max`) come back with unit `"undefined"` and null values; they stay null in Silver for archive days
+- Ignores `current`; current weather can't be fetched for past times
+- Lags real time: for days it doesn't have yet it returns HTTP 200 with null-filled arrays, so Bronze falls back to the forecast endpoint for that window
 
 ### Rate Limits (Free Tier)
 - 600 calls/minute
-- 10,000 calls/day
+- 10,000 calls/day: scheduled usage is `locations × (24 + 1440 / current_interval_minutes)` (~83 locations at 15 min). `warn_if_over_api_budget()` logs a warning above 80%
 
 ## Testing Strategy
 
@@ -155,14 +171,16 @@ hourly_variables:
 - **Asset tests** use Dagster's `materialize()` test utility
 - **Fixtures** in `tests/conftest.py` provide sample API responses, a fake API client and temp directories
 - The `data_dir` fixture sets `WEATHER_FORECAST_DATA_DIR`, which `get_data_dir()` honours; never write to the real `data/` in tests
+- The `variables_config` fixture writes a temp `variables.yaml` (via `WEATHER_FORECAST_CONFIG_DIR`) and clears the loader caches; use it to test config-driven behaviour
 - Tests must not hit the network: mock HTTP with `respx` or pass `FakeOpenMeteoClient`
 
 ## Conventions
 
 - All timestamps stored in **UTC** (with a separate `timestamp_local` column)
-- Partitions are **UTC calendar days**; the API is queried with `timezone=GMT` and local time is derived from each location's IANA timezone in Silver. Use `utc_today()`, never `date.today()`
+- Partitions are **UTC calendar days**. The API is queried in each location's timezone with `timeformat=unixtime`: hourly rows are kept by UTC date, daily rows by local date (DST-safe via `zoneinfo`). Use `utc_today()`, never `date.today()`
 - Don't add `from __future__ import annotations` to asset modules: Dagster rejects the stringified `context: AssetExecutionContext` hint
 - Parquet files use **snappy** compression
-- DuckDB Gold tables use **upsert** semantics (idempotent re-runs)
+- DuckDB Gold tables use **upsert** semantics (idempotent re-runs); `gold_current_conditions` is replaced on each run
+- Never hard-code variable names outside Gold: Bronze/Silver read them from config
 - Config changes go in **YAML files**, not Python code
 - Weather variable nulls are **preserved** (e.g., UV index is null at night)

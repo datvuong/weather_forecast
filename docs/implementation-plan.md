@@ -713,7 +713,7 @@ def test_bronze_forecast_creates_parquet(tmp_path, mock_api_response):
 ## Phase 8: Dynamic Open-Meteo Variables — Hourly, Daily & Current
 
 > [!IMPORTANT]
-> **Status: approved 2026-10-24 (D1–D4).** Tracked in story **#15** and its sub-issues #16–#21 (§8.12).
+> **Status: implemented 2026-10-24.** Approved D1–D4; tracked in story **#15** and sub-issues #16–#21 (§8.12), one commit each. `bronze_forecast` kept its name (the rename floated in §8.6 wasn't needed).
 
 ### 8.1 — Problem
 

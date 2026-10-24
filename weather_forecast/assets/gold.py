@@ -7,6 +7,10 @@ Gold assets:
 - gold_daily_temperature: min/max/avg temperature, humidity, wind, UV
 - gold_daily_precipitation: precipitation totals, probability, rainy hours
 
+The SQL depends on specific hourly variables and metric units (column names
+end in _c, _kmh, _mm); validate_gold_requirements() checks the config for
+them when the Dagster definitions load.
+
 File layout:
     data/gold/daily_temperature/{partition_date}.parquet
     data/gold/daily_precipitation/{partition_date}.parquet
@@ -25,11 +29,54 @@ from dagster import (
 )
 
 from weather_forecast.assets.silver import silver_hourly_weather, silver_path
+from weather_forecast.models.weather import VariablesConfig
 from weather_forecast.partitions import daily_partitions
 from weather_forecast.resources.duckdb_resource import DuckDBResource
 from weather_forecast.utils.helpers import get_data_dir, load_locations_config
 
 logger = logging.getLogger(__name__)
+
+# Hourly variables each Gold asset's SQL reads
+REQUIRED_HOURLY_VARIABLES: dict[str, tuple[str, ...]] = {
+    "gold_daily_temperature": (
+        "temperature_2m",
+        "relative_humidity_2m",
+        "wind_speed_10m",
+        "uv_index",
+    ),
+    "gold_daily_precipitation": ("precipitation", "precipitation_probability"),
+}
+
+# Units implied by the Gold column names
+REQUIRED_UNITS: dict[str, str] = {
+    "temperature_unit": "celsius",
+    "wind_speed_unit": "kmh",
+    "precipitation_unit": "mm",
+}
+
+
+def validate_gold_requirements(config: VariablesConfig) -> None:
+    """Fail fast if the config lacks variables or units the Gold SQL relies on.
+
+    Raises:
+        ValueError: Listing every missing hourly variable and non-metric unit.
+    """
+    configured = set(config.hourly_names)
+    problems = [
+        f"{asset_name} needs hourly variables {missing}"
+        for asset_name, required in REQUIRED_HOURLY_VARIABLES.items()
+        if (missing := [v for v in required if v not in configured])
+    ]
+    problems += [
+        f"Gold column names assume {field}={expected!r}, got {actual!r}"
+        for field, expected in REQUIRED_UNITS.items()
+        if (actual := getattr(config.settings, field)) != expected
+    ]
+    if problems:
+        raise ValueError(
+            "config/variables.yaml doesn't meet Gold layer requirements:\n- "
+            + "\n- ".join(problems)
+        )
 
 
 @asset(

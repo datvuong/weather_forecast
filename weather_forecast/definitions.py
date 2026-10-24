@@ -19,6 +19,7 @@ from weather_forecast.assets.gold import (
     gold_daily_precipitation,
     gold_daily_temperature,
     gold_temperature_check,
+    validate_gold_requirements,
 )
 from weather_forecast.assets.silver import (
     silver_daily_check,
@@ -41,6 +42,7 @@ from weather_forecast.utils.helpers import (
     warn_if_over_api_budget,
 )
 
+validate_gold_requirements(load_variables_config())
 warn_if_over_api_budget(len(load_locations_config()), load_variables_config())
 
 defs = dg.Definitions(

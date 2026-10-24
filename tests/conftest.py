@@ -257,6 +257,7 @@ def variables_config(tmp_path, monkeypatch):
         load_locations_config.cache_clear()
         return load_variables_config()
 
+    write()  # start from the project's config so the loaders work immediately
     yield write
     load_variables_config.cache_clear()
     load_locations_config.cache_clear()
