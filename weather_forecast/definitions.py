@@ -16,6 +16,7 @@ from weather_forecast.assets.gold import (
 from weather_forecast.assets.silver import silver_hourly_weather, silver_quality_check
 from weather_forecast.resources.api_client import OpenMeteoClient
 from weather_forecast.resources.duckdb_resource import DuckDBResource
+from weather_forecast.schedules import hourly_weather_schedule, weather_pipeline_job
 from weather_forecast.utils.helpers import get_warehouse_dir
 
 defs = dg.Definitions(
@@ -30,6 +31,8 @@ defs = dg.Definitions(
         silver_quality_check,
         gold_temperature_check,
     ],
+    jobs=[weather_pipeline_job],
+    schedules=[hourly_weather_schedule],
     resources={
         "open_meteo_client": OpenMeteoClient(),
         "duckdb_resource": DuckDBResource(

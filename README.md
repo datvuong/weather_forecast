@@ -75,14 +75,29 @@ Open-Meteo API
                                 └──────────┘
 ```
 
+## Scheduling
+
+`hourly_weather_schedule` runs `weather_pipeline_job` (Bronze → Silver → Gold) every hour at `:00` UTC
+for **today's UTC partition**, refreshing the latest forecast. Turn it on under
+**Overview → Schedules** in the Dagster UI (schedules start stopped).
+
+Partitions are **UTC calendar days**: in Adelaide (UTC+10:30) the `2026-10-24` partition covers
+10:30 on the 24th to 09:30 on the 25th, local time. Each Silver row has both
+`timestamp_utc` and `timestamp_local`.
+
 ## Historical Backfill
 
-On initial setup, backfill 30 days of historical data via the Dagster UI:
+On initial setup, backfill the last 30 days (`backfill_days` in `config/variables.yaml`) through
+every layer:
 
 1. Open http://localhost:3000
-2. Navigate to **Assets** → `bronze_forecast`
-3. Click **Materialize** → select partition range (last 30 days)
-4. Dagster processes all partitions through Bronze → Silver → Gold
+2. Navigate to **Jobs** → `weather_pipeline_job`
+3. Click **Materialize all** → **Select partitions** → choose the date range → **Launch backfill**
+4. Each partition runs Bronze → Silver → Gold. Past days use the archive API; recent days the
+   archive doesn't have yet fall back to the forecast API automatically
+
+> Materializing only `bronze_forecast` does **not** update Silver/Gold. Select all assets (or
+> use the job) so downstream layers run too.
 
 ## Testing
 
