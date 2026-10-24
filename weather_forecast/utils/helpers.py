@@ -10,10 +10,8 @@ from pathlib import Path
 import yaml
 
 from weather_forecast.models.weather import (
-    APISettings,
     LocationConfig,
     LocationsConfig,
-    VariableDefinition,
     VariablesConfig,
 )
 
@@ -78,10 +76,7 @@ def load_variables_config(config_path: str | Path | None = None) -> VariablesCon
     with open(config_path) as f:
         raw = yaml.safe_load(f)
 
-    return VariablesConfig(
-        hourly_variables=[VariableDefinition(**v) for v in raw["hourly_variables"]],
-        settings=APISettings(**raw.get("settings", {})),
-    )
+    return VariablesConfig.model_validate(raw)
 
 
 def get_variable_names(config_path: str | Path | None = None) -> list[str]:

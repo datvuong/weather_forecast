@@ -10,6 +10,8 @@ from weather_forecast.models.weather import (
     BronzeRecord,
     HourlyWeatherRecord,
     LocationConfig,
+    VariableDefinition,
+    VariablesConfig,
 )
 from weather_forecast.utils.helpers import (
     get_data_dir,
@@ -43,15 +45,101 @@ class TestLocationConfig:
             LocationConfig(name="X", latitude=lat, longitude=lon, timezone="UTC")
 
 
+def _var(name, **kwargs):
+    return {"name": name, "description": name, "unit": "x", **kwargs}
+
+
+class TestVariableDefinition:
+    def test_valid_range(self):
+        v = VariableDefinition(**_var("temperature_2m", valid_range=[-60, 65]))
+        assert v.valid_range == (-60.0, 65.0)
+
+    def test_valid_range_optional(self):
+        assert VariableDefinition(**_var("sunrise")).valid_range is None
+
+    def test_inverted_range_rejected(self):
+        with pytest.raises(ValidationError, match="min must be <= max"):
+            VariableDefinition(**_var("x", valid_range=[10, 0]))
+
+    @pytest.mark.parametrize("name", ["time", "location_name", "timestamp_utc", "date_local"])
+    def test_reserved_column_names_rejected(self, name):
+        with pytest.raises(ValidationError, match="reserved"):
+            VariableDefinition(**_var(name))
+
+
 class TestAPISettings:
     def test_defaults(self):
         s = APISettings()
         assert (s.forecast_days, s.backfill_days) == (7, 30)
+        assert s.current_interval_minutes == 15
+        assert s.extra_params == {}
 
     @pytest.mark.parametrize("days", [0, 17])
     def test_forecast_days_bounds(self, days):
         with pytest.raises(ValidationError):
             APISettings(forecast_days=days)
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [("temperature_unit", "kelvin"), ("wind_speed_unit", "fps"), ("precipitation_unit", "cm")],
+    )
+    def test_invalid_units_rejected(self, field, value):
+        with pytest.raises(ValidationError):
+            APISettings(**{field: value})
+
+    @pytest.mark.parametrize("minutes", [15, 30, 60])
+    def test_current_interval_allowed(self, minutes):
+        assert APISettings(current_interval_minutes=minutes).current_interval_minutes == minutes
+
+    @pytest.mark.parametrize("minutes", [0, 5, 45, 120])
+    def test_current_interval_rejected(self, minutes):
+        with pytest.raises(ValidationError):
+            APISettings(current_interval_minutes=minutes)
+
+    def test_request_params_merge_units_and_extras(self):
+        s = APISettings(wind_speed_unit="ms", extra_params={"models": "best_match"})
+        assert s.request_params == {
+            "temperature_unit": "celsius",
+            "wind_speed_unit": "ms",
+            "precipitation_unit": "mm",
+            "models": "best_match",
+        }
+
+    @pytest.mark.parametrize("key", ["hourly", "timezone", "timeformat", "start_date", "latitude"])
+    def test_reserved_extra_params_rejected(self, key):
+        with pytest.raises(ValidationError, match="pipeline-controlled"):
+            APISettings(extra_params={key: "x"})
+
+
+class TestVariablesConfig:
+    def test_sections_default_empty(self):
+        config = VariablesConfig(hourly_variables=[_var("temperature_2m")])
+        assert config.daily_names == []
+        assert config.current_names == []
+        assert config.variable_names == config.hourly_names == ["temperature_2m"]
+
+    def test_section_accessors(self):
+        config = VariablesConfig(
+            hourly_variables=[_var("temperature_2m")],
+            daily_variables=[_var("sunrise"), _var("precipitation_sum")],
+            current_variables=[_var("is_day")],
+        )
+        assert config.names("daily") == ["sunrise", "precipitation_sum"]
+        assert [v.name for v in config.section("current")] == ["is_day"]
+
+    def test_same_name_allowed_across_sections(self):
+        config = VariablesConfig(
+            hourly_variables=[_var("temperature_2m")],
+            current_variables=[_var("temperature_2m")],
+        )
+        assert config.current_names == ["temperature_2m"]
+
+    def test_duplicate_within_section_rejected(self):
+        with pytest.raises(ValidationError, match="duplicate daily variables"):
+            VariablesConfig(
+                hourly_variables=[_var("temperature_2m")],
+                daily_variables=[_var("sunrise"), _var("sunrise")],
+            )
 
 
 class TestHourlyWeatherRecord:
@@ -110,7 +198,9 @@ class TestConfigLoaders:
     def test_project_variables(self):
         config = load_variables_config()
         assert "temperature_2m" in config.variable_names
+        assert config.daily_names and config.current_names
         assert config.settings.forecast_days >= 1
+        assert config.section("hourly")[0].valid_range is not None
 
     def test_custom_locations_file(self, tmp_path):
         path = tmp_path / "locations.yaml"

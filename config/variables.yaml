@@ -1,45 +1,142 @@
 # Weather Forecast Pipeline - Weather Variables Configuration
 # ===========================================================
-# Open-Meteo hourly variable names.
+# Open-Meteo variable names, per request section.
 # Full list of available variables: https://open-meteo.com/en/docs
 #
-# Add or remove variables as needed. Each entry requires:
-#   name:        Open-Meteo API parameter name
+# Three request sections, each a list of variables:
+#   hourly_variables:  hourly time series (partitioned by UTC day)
+#   daily_variables:   daily aggregates over the location's local calendar day
+#   current_variables: 15-minute "current conditions" snapshots (forecast API only)
+#
+# Add or remove variables as needed; no code changes are required. Each entry has:
+#   name:        Open-Meteo API parameter name (must be valid for that section)
 #   description: Human-readable description
-#   unit:        Unit of measurement
+#   unit:        Unit of measurement (documentation; "iso8601"/"unixtime" marks a time value)
+#   valid_range: Optional [min, max] enforced by the Silver quality checks
+#
+# Variables an endpoint doesn't support (e.g. precipitation_probability in the archive)
+# are kept as null columns rather than failing the run.
 
 hourly_variables:
   - name: temperature_2m
     description: "Air temperature at 2 meters above ground"
     unit: "°C"
+    valid_range: [-60, 65]
 
   - name: relative_humidity_2m
     description: "Relative humidity at 2 meters above ground"
     unit: "%"
+    valid_range: [0, 100]
 
   - name: precipitation
     description: "Total precipitation (rain + showers + snow)"
     unit: "mm"
+    valid_range: [0, 500]
 
   - name: precipitation_probability
     description: "Probability of precipitation (forecast only, null for historical)"
     unit: "%"
+    valid_range: [0, 100]
 
   - name: wind_speed_10m
     description: "Wind speed at 10 meters above ground"
     unit: "km/h"
+    valid_range: [0, 400]
 
   - name: wind_direction_10m
     description: "Wind direction at 10 meters above ground"
     unit: "°"
+    valid_range: [0, 360]
 
   - name: wind_gusts_10m
     description: "Wind gusts at 10 meters above ground"
     unit: "km/h"
+    valid_range: [0, 500]
 
   - name: uv_index
     description: "UV index for the hour"
     unit: "index"
+    valid_range: [0, 20]
+
+daily_variables:
+  - name: temperature_2m_max
+    description: "Maximum daily air temperature at 2 meters"
+    unit: "°C"
+    valid_range: [-60, 65]
+
+  - name: temperature_2m_min
+    description: "Minimum daily air temperature at 2 meters"
+    unit: "°C"
+    valid_range: [-60, 65]
+
+  - name: precipitation_sum
+    description: "Sum of daily precipitation"
+    unit: "mm"
+    valid_range: [0, 2000]
+
+  - name: precipitation_probability_max
+    description: "Maximum probability of precipitation (forecast only, null for historical)"
+    unit: "%"
+    valid_range: [0, 100]
+
+  - name: wind_speed_10m_max
+    description: "Maximum wind speed at 10 meters"
+    unit: "km/h"
+    valid_range: [0, 400]
+
+  - name: uv_index_max
+    description: "Daily maximum UV index (forecast only, null for historical)"
+    unit: "index"
+    valid_range: [0, 20]
+
+  - name: sunrise
+    description: "Sunrise time"
+    unit: "iso8601"
+
+  - name: sunset
+    description: "Sunset time"
+    unit: "iso8601"
+
+current_variables:
+  - name: temperature_2m
+    description: "Current air temperature at 2 meters"
+    unit: "°C"
+    valid_range: [-60, 65]
+
+  - name: relative_humidity_2m
+    description: "Current relative humidity at 2 meters"
+    unit: "%"
+    valid_range: [0, 100]
+
+  - name: apparent_temperature
+    description: "Current feels-like temperature"
+    unit: "°C"
+    valid_range: [-80, 80]
+
+  - name: precipitation
+    description: "Precipitation in the current 15-minute interval"
+    unit: "mm"
+    valid_range: [0, 500]
+
+  - name: weather_code
+    description: "WMO weather interpretation code"
+    unit: "wmo code"
+    valid_range: [0, 99]
+
+  - name: wind_speed_10m
+    description: "Current wind speed at 10 meters"
+    unit: "km/h"
+    valid_range: [0, 400]
+
+  - name: wind_direction_10m
+    description: "Current wind direction at 10 meters"
+    unit: "°"
+    valid_range: [0, 360]
+
+  - name: is_day
+    description: "1 during daylight, 0 at night"
+    unit: "flag"
+    valid_range: [0, 1]
 
 # API query settings
 settings:
@@ -48,3 +145,5 @@ settings:
   precipitation_unit: mm          # mm | inch
   forecast_days: 7                # Number of forecast days (1-16)
   backfill_days: 30               # Days of historical data to load on first run
+  current_interval_minutes: 15    # Current-weather poll cadence: 15 | 30 | 60
+  extra_params: {}                # Extra Open-Meteo query params, e.g. {models: best_match}
