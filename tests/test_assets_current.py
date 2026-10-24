@@ -108,9 +108,8 @@ class TestBronzeCurrent:
         assert result.success
         assert client.calls == []
         assert not (data_dir / "bronze" / "current").exists()
-        metadata = result.asset_materializations_for_node("bronze_current")[0].metadata
-        assert metadata["snapshots_written"].value == 0
-        assert "today" in metadata["skipped"].value
+        # No materialization: the past day stays "missing" instead of looking done (#35)
+        assert result.asset_materializations_for_node("bronze_current") == []
 
     def test_skipped_without_current_variables(self, data_dir, variables_config):
         variables_config(current_variables=[])
@@ -119,8 +118,7 @@ class TestBronzeCurrent:
         result = _run_bronze(client, utc_today().isoformat())
 
         assert client.calls == []
-        metadata = result.asset_materializations_for_node("bronze_current")[0].metadata
-        assert metadata["skipped"].value == "no current_variables configured"
+        assert result.asset_materializations_for_node("bronze_current") == []
 
     def test_snapshot_outside_partition_is_skipped(self, data_dir, locations):
         yesterday_late = datetime.combine(
@@ -132,6 +130,25 @@ class TestBronzeCurrent:
 
         assert result.success
         assert not (data_dir / "bronze" / "current").exists()
+        assert result.asset_materializations_for_node("bronze_current") == []
+
+    def test_past_partition_skips_the_whole_current_chain(
+        self, data_dir, duckdb_resource, past_date
+    ):
+        client = FakeOpenMeteoClient(forecast_response=make_current_response(_slot()))
+
+        result = dg.materialize(
+            [bronze_current, silver_current_weather, gold_current_conditions,
+             silver_current_check, gold_current_freshness_check],
+            partition_key=past_date.isoformat(),
+            resources={"open_meteo_client": client, "duckdb_resource": duckdb_resource},
+        )
+
+        assert result.success
+        assert result.get_asset_materialization_events() == []
+        skipped = {e.step_key for e in result.all_events if e.event_type_value == "STEP_SKIPPED"}
+        assert {"silver_current_weather", "gold_current_conditions"} <= skipped
+        assert not (data_dir / "silver" / "current").exists()  # no empty history file
 
 
 class TestSilverCurrent:

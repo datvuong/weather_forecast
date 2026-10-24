@@ -187,7 +187,8 @@ every layer:
 
 > Materializing only `bronze_forecast` does **not** update Silver/Gold. Select all assets (or
 > use the job) so downstream layers run too. Current-weather assets aren't part of the job and
-> can't be backfilled.
+> can't be backfilled. Don't backfill `current_weather_job`: past partitions fetch nothing and record no
+> materialization.
 
 ## Testing
 

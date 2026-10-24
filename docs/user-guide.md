@@ -260,7 +260,8 @@ Current conditions are the forecast model's value for the current 15-minute slot
   ```
 
 - Running it again within the same 15-minute slot overwrites that snapshot instead of duplicating it.
-- Running it for a past date does nothing (the run succeeds and its metadata says why).
+- Running it for a past date fetches nothing: the run succeeds, logs why, and records **no** materialization (the downstream steps show as skipped), so past days stay "missing".
+- **Don't backfill `current_weather_job`.** Past current conditions don't exist, so a backfill only adds dozens of empty runs. To build history, backfill `weather_pipeline_job`; for current weather, turn on `current_weather_schedule`.
 
 ## 6. Turn on the schedules
 

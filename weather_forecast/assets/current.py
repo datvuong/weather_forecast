@@ -22,6 +22,7 @@ File layout:
 
 import json
 import logging
+from collections.abc import Iterator
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -30,6 +31,7 @@ import pyarrow.parquet as pq
 from dagster import (
     AssetCheckResult,
     AssetExecutionContext,
+    MaterializeResult,
     MetadataValue,
     asset,
     asset_check,
@@ -80,17 +82,23 @@ def current_conditions_path() -> Path:
     group_name="bronze",
     compute_kind="python",
     description="Raw 15-minute current-weather snapshots (today only, one file per snapshot).",
+    # Yields no materialization when nothing was fetched, so past days stay "missing"
+    # and the downstream current-weather steps are skipped (#35)
+    output_required=False,
 )
 def bronze_current(
     context: AssetExecutionContext,
     open_meteo_client: OpenMeteoClient,
-) -> None:
+) -> Iterator[MaterializeResult]:
     """Fetch and store the current-conditions snapshot for every location.
 
     Each file is named after the snapshot's observation time (current.time),
     so re-running within the same 15-minute slot overwrites the same file.
     For any partition other than today (UTC) nothing is fetched or written:
-    current conditions can't be retrieved retroactively.
+    current conditions can't be retrieved retroactively. In that case (and
+    when no snapshot could be written) the asset records NO materialization
+    and silver_current_weather / gold_current_conditions are skipped, instead
+    of marking the day as materialized with empty data.
     """
     partition_date_str = context.partition_key
     partition_date = date.fromisoformat(partition_date_str)
@@ -102,8 +110,9 @@ def bronze_current(
     elif partition_date != utc_today():
         skip_reason = "current weather can only be fetched for today's (UTC) partition"
     if skip_reason:
-        context.log.warning(f"Skipping current weather for {partition_date_str}: {skip_reason}")
-        context.add_output_metadata({"snapshots_written": 0, "skipped": skip_reason})
+        context.log.warning(
+            f"Not materializing current weather for {partition_date_str}: {skip_reason}"
+        )
         return
 
     ingestion_ts = datetime.now(timezone.utc)
@@ -146,8 +155,11 @@ def bronze_current(
         observed[location.name] = observed_at.isoformat()
         context.log.info(f"Wrote current snapshot for {location.name} at {observed_at:%H:%M} UTC")
 
-    context.add_output_metadata(
-        {
+    if not observed:
+        context.log.warning(f"No current snapshot written for {partition_date_str}")
+        return
+    yield MaterializeResult(
+        metadata={
             "snapshots_written": len(observed),
             "observed_at_utc": MetadataValue.json(observed),
             "unsupported_variables": MetadataValue.json(unsupported),
