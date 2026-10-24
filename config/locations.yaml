@@ -1,0 +1,21 @@
+# Weather Forecast Pipeline - Location Configuration
+# ===================================================
+# Add or remove locations as needed. Each entry requires:
+#   name:      Human-readable city name (used as identifier in data files)
+#   latitude:  WGS84 latitude in decimal degrees
+#   longitude: WGS84 longitude in decimal degrees
+#   timezone:  IANA timezone string (used for local timestamp conversion)
+#
+# Find coordinates: https://www.latlong.net/
+# Find timezones:   https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+
+locations:
+  - name: Melbourne
+    latitude: -37.8136
+    longitude: 144.9631
+    timezone: Australia/Melbourne
+
+  - name: Adelaide
+    latitude: -34.9285
+    longitude: 138.6007
+    timezone: Australia/Adelaide

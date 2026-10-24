@@ -1,0 +1,50 @@
+# Weather Forecast Pipeline - Weather Variables Configuration
+# ===========================================================
+# Open-Meteo hourly variable names.
+# Full list of available variables: https://open-meteo.com/en/docs
+#
+# Add or remove variables as needed. Each entry requires:
+#   name:        Open-Meteo API parameter name
+#   description: Human-readable description
+#   unit:        Unit of measurement
+
+hourly_variables:
+  - name: temperature_2m
+    description: "Air temperature at 2 meters above ground"
+    unit: "°C"
+
+  - name: relative_humidity_2m
+    description: "Relative humidity at 2 meters above ground"
+    unit: "%"
+
+  - name: precipitation
+    description: "Total precipitation (rain + showers + snow)"
+    unit: "mm"
+
+  - name: precipitation_probability
+    description: "Probability of precipitation (forecast only, null for historical)"
+    unit: "%"
+
+  - name: wind_speed_10m
+    description: "Wind speed at 10 meters above ground"
+    unit: "km/h"
+
+  - name: wind_direction_10m
+    description: "Wind direction at 10 meters above ground"
+    unit: "°"
+
+  - name: wind_gusts_10m
+    description: "Wind gusts at 10 meters above ground"
+    unit: "km/h"
+
+  - name: uv_index
+    description: "UV index for the hour"
+    unit: "index"
+
+# API query settings
+settings:
+  temperature_unit: celsius       # celsius | fahrenheit
+  wind_speed_unit: kmh            # kmh | ms | mph | kn
+  precipitation_unit: mm          # mm | inch
+  forecast_days: 7                # Number of forecast days (1-16)
+  backfill_days: 30               # Days of historical data to load on first run
