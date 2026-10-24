@@ -6,6 +6,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from weather_forecast.resources.api_client import OpenMeteoRequest
 from weather_forecast.resources.duckdb_resource import DuckDBResource
 from weather_forecast.utils.helpers import load_locations_config, utc_today
 
@@ -65,23 +66,21 @@ def make_api_response(
 
 
 class FakeOpenMeteoClient:
-    """Stand-in for OpenMeteoClient that records calls and returns canned data."""
+    """Stand-in for OpenMeteoClient that records requests and returns canned data."""
 
     def __init__(self, archive_response=None, forecast_response=None, archive_error=None):
         self.archive_response = archive_response
         self.forecast_response = forecast_response
         self.archive_error = archive_error
-        self.calls: list[tuple[str, dict]] = []
+        self.calls: list[tuple[str, OpenMeteoRequest]] = []
 
-    def fetch_forecast(self, **kwargs) -> dict:
-        self.calls.append(("forecast", kwargs))
+    def fetch(self, endpoint: str, request: OpenMeteoRequest) -> dict:
+        self.calls.append((endpoint, request))
+        if endpoint == "archive":
+            if self.archive_error is not None:
+                raise self.archive_error
+            return self.archive_response
         return self.forecast_response
-
-    def fetch_historical(self, **kwargs) -> dict:
-        self.calls.append(("archive", kwargs))
-        if self.archive_error is not None:
-            raise self.archive_error
-        return self.archive_response
 
 
 def write_bronze_file(

@@ -27,7 +27,7 @@ from dagster import (
 
 from weather_forecast.models.weather import APISettings, LocationConfig
 from weather_forecast.partitions import daily_partitions
-from weather_forecast.resources.api_client import OpenMeteoClient
+from weather_forecast.resources.api_client import OpenMeteoClient, OpenMeteoRequest
 from weather_forecast.utils.helpers import (
     get_data_dir,
     load_locations_config,
@@ -66,33 +66,26 @@ def _fetch_location(
     Returns:
         Tuple of (raw JSON response, endpoint name: "forecast" or "archive").
     """
-    units = {
-        "temperature_unit": settings.temperature_unit,
-        "wind_speed_unit": settings.wind_speed_unit,
-        "precipitation_unit": settings.precipitation_unit,
-    }
+    def request(**window) -> OpenMeteoRequest:
+        return OpenMeteoRequest(
+            latitude=location.latitude,
+            longitude=location.longitude,
+            hourly=variable_names,
+            timezone="GMT",
+            timeformat="iso8601",
+            params=settings.request_params,
+            **window,
+        )
 
     if partition_date >= utc_today():
         # Current day — full forecast horizon is kept in Bronze
-        raw_response = client.fetch_forecast(
-            latitude=location.latitude,
-            longitude=location.longitude,
-            hourly_variables=variable_names,
-            forecast_days=settings.forecast_days,
-            **units,
-        )
+        raw_response = client.fetch("forecast", request(forecast_days=settings.forecast_days))
         return raw_response, "forecast"
 
     # Historical data — use archive endpoint
+    one_day = {"start_date": partition_date, "end_date": partition_date}
     try:
-        raw_response = client.fetch_historical(
-            latitude=location.latitude,
-            longitude=location.longitude,
-            hourly_variables=variable_names,
-            start_date=partition_date,
-            end_date=partition_date,
-            **units,
-        )
+        raw_response = client.fetch("archive", request(**one_day))
         if _has_hourly_values(raw_response):
             return raw_response, "archive"
         context.log.warning(
@@ -105,14 +98,7 @@ def _fetch_location(
             f"falling back to forecast: {e}"
         )
 
-    raw_response = client.fetch_forecast(
-        latitude=location.latitude,
-        longitude=location.longitude,
-        hourly_variables=variable_names,
-        start_date=partition_date,
-        end_date=partition_date,
-        **units,
-    )
+    raw_response = client.fetch("forecast", request(**one_day))
     return raw_response, "forecast"
 
 

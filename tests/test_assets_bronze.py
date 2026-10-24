@@ -29,7 +29,7 @@ def test_today_uses_forecast_endpoint(data_dir, locations):
 
     assert result.success
     assert [c[0] for c in client.calls] == ["forecast"] * len(locations)
-    assert all(c[1]["forecast_days"] == 7 for c in client.calls)
+    assert all(c[1].forecast_days == 7 for c in client.calls)
     for loc in locations:
         table = pq.read_table(data_dir / "bronze" / loc.name / f"{today}.parquet")
         row = table.to_pylist()[0]
@@ -46,7 +46,7 @@ def test_past_date_uses_archive_endpoint(data_dir, locations, past_date):
 
     assert result.success
     assert [c[0] for c in client.calls] == ["archive"] * len(locations)
-    assert client.calls[0][1]["start_date"] == client.calls[0][1]["end_date"] == past_date
+    assert client.calls[0][1].start_date == client.calls[0][1].end_date == past_date
     row = pq.read_table(
         data_dir / "bronze" / locations[0].name / f"{past_date}.parquet"
     ).to_pylist()[0]
@@ -66,9 +66,9 @@ def test_archive_without_data_falls_back_to_forecast_for_that_date(data_dir, pas
     result = _materialize(client, past_date.isoformat())
 
     assert result.success
-    forecast_calls = [kw for kind, kw in client.calls if kind == "forecast"]
+    forecast_calls = [r for kind, r in client.calls if kind == "forecast"]
     assert forecast_calls
-    assert all(kw["start_date"] == kw["end_date"] == past_date for kw in forecast_calls)
+    assert all(r.start_date == r.end_date == past_date for r in forecast_calls)
 
 
 def test_archive_error_falls_back_to_forecast(data_dir, locations, past_date):

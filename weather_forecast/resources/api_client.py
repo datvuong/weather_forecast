@@ -1,8 +1,9 @@
 """Open-Meteo API client — Dagster ConfigurableResource.
 
 Wraps the Open-Meteo forecast and archive HTTP endpoints with:
-- Configurable base URLs
-- httpx with timeout and retry logic
+- A generic request model (any hourly/daily/current variables, any extra params)
+- httpx with timeout and retry logic for transient failures
+- Fail-fast errors carrying Open-Meteo's `reason` for invalid requests
 - Returns raw JSON dicts for Bronze layer storage
 """
 
@@ -11,9 +12,11 @@ from __future__ import annotations
 import logging
 import time
 from datetime import date
+from typing import Literal
 
 import httpx
 from dagster import ConfigurableResource
+from pydantic import BaseModel, Field, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -22,17 +25,133 @@ MAX_RETRIES = 3
 BACKOFF_FACTOR = 1.0  # seconds: 1, 2, 4
 REQUEST_TIMEOUT = 30.0  # seconds
 
-# Request hourly timestamps in UTC so they line up with the UTC daily partitions.
-# Local time is derived per location in the Silver layer.
-API_TIMEZONE = "GMT"
+Endpoint = Literal["forecast", "archive"]
+Section = Literal["hourly", "daily", "current"]
+SECTIONS: tuple[Section, ...] = ("hourly", "daily", "current")
+
+# Unit Open-Meteo reports for a variable the endpoint doesn't support (values are null)
+UNSUPPORTED_UNIT = "undefined"
+
+
+class OpenMeteoAPIError(Exception):
+    """Open-Meteo rejected a request (HTTP error status or an error body)."""
+
+    def __init__(self, status_code: int, reason: str):
+        self.status_code = status_code
+        self.reason = reason
+        super().__init__(f"Open-Meteo API error {status_code}: {reason}")
+
+
+class OpenMeteoRequest(BaseModel):
+    """A single-location Open-Meteo query, independent of specific variables.
+
+    Attributes:
+        hourly/daily/current: Variable names per request section; empty sections
+            are omitted from the query.
+        timezone: IANA timezone for local times and daily aggregation windows.
+        timeformat: "iso8601" local-time strings or "unixtime" UTC epoch seconds.
+        start_date/end_date: Explicit date range (interpreted in `timezone`).
+            Mutually exclusive with forecast_days/past_days.
+        params: Any other query parameters (units, models, cell_selection, ...).
+    """
+
+    latitude: float
+    longitude: float
+    hourly: list[str] = Field(default_factory=list)
+    daily: list[str] = Field(default_factory=list)
+    current: list[str] = Field(default_factory=list)
+    timezone: str = "GMT"
+    timeformat: Literal["iso8601", "unixtime"] = "unixtime"
+    start_date: date | None = None
+    end_date: date | None = None
+    forecast_days: int | None = None
+    past_days: int | None = None
+    params: dict[str, str | int | float | bool] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_window(self) -> OpenMeteoRequest:
+        """Require both or neither of start/end date, exclusive of day counts."""
+        if (self.start_date is None) != (self.end_date is None):
+            raise ValueError("start_date and end_date must be given together")
+        if self.start_date is not None and (
+            self.forecast_days is not None or self.past_days is not None
+        ):
+            raise ValueError("start_date/end_date can't be combined with forecast_days/past_days")
+        return self
+
+    def to_query(self, endpoint: Endpoint) -> dict[str, str | int | float]:
+        """Build the HTTP query parameters for an endpoint.
+
+        The archive endpoint has no `current` section and needs an explicit
+        date range; forecast-only day counts are dropped for it.
+        """
+        if endpoint == "archive" and self.start_date is None:
+            raise ValueError("archive requests need start_date and end_date")
+
+        query: dict[str, str | int | float] = {
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+        }
+        for section in SECTIONS:
+            names = getattr(self, section)
+            if names and not (section == "current" and endpoint == "archive"):
+                query[section] = ",".join(names)
+        query["timezone"] = self.timezone
+        query["timeformat"] = self.timeformat
+
+        if self.start_date is not None:
+            query["start_date"] = self.start_date.isoformat()
+            query["end_date"] = self.end_date.isoformat()
+        elif endpoint == "forecast":
+            if self.forecast_days is not None:
+                query["forecast_days"] = self.forecast_days
+            if self.past_days is not None:
+                query["past_days"] = self.past_days
+
+        for key, value in self.params.items():
+            query[key] = str(value).lower() if isinstance(value, bool) else value
+        return query
+
+
+def unsupported_variables(response: dict) -> dict[str, list[str]]:
+    """Return variables per section that the endpoint reported as unsupported.
+
+    Open-Meteo answers unsupported variables (e.g. precipitation_probability
+    from the archive) with unit "undefined" and null values instead of an error.
+    """
+    result = {}
+    for section in SECTIONS:
+        units = response.get(f"{section}_units") or {}
+        names = [name for name, unit in units.items() if unit == UNSUPPORTED_UNIT]
+        if names:
+            result[section] = names
+    return result
+
+
+def _error_reason(response: httpx.Response) -> str:
+    """Extract Open-Meteo's error reason from a response body."""
+    try:
+        return response.json().get("reason") or response.text
+    except ValueError:
+        return response.text
+
+
+def _is_retryable(error: Exception) -> bool:
+    """Transport failures, rate limiting and server errors are worth retrying."""
+    if isinstance(error, httpx.TransportError):
+        return True
+    if isinstance(error, OpenMeteoAPIError):
+        return error.status_code == 429 or error.status_code >= 500
+    return False
 
 
 class OpenMeteoClient(ConfigurableResource):
     """Dagster resource for fetching weather data from Open-Meteo API.
 
-    This resource provides methods to fetch forecast and historical weather
-    data. It handles retries with exponential backoff and returns raw JSON
-    responses suitable for Bronze layer storage.
+    The client knows nothing about specific variables: callers describe the
+    query with an OpenMeteoRequest. Transient failures are retried with
+    exponential backoff; invalid requests fail immediately with Open-Meteo's
+    reason. Raw JSON responses are returned for Bronze layer storage.
 
     Attributes:
         base_url: Open-Meteo forecast API base URL.
@@ -41,6 +160,17 @@ class OpenMeteoClient(ConfigurableResource):
 
     base_url: str = "https://api.open-meteo.com/v1/forecast"
     archive_url: str = "https://archive-api.open-meteo.com/v1/archive"
+
+    def _get(self, url: str, params: dict) -> dict:
+        """Make a single GET request, raising OpenMeteoAPIError on API errors."""
+        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+            response = client.get(url, params=params)
+        if response.is_error:
+            raise OpenMeteoAPIError(response.status_code, _error_reason(response))
+        body = response.json()
+        if isinstance(body, dict) and body.get("error"):
+            raise OpenMeteoAPIError(response.status_code, body.get("reason", "unknown error"))
+        return body
 
     def _request_with_retry(self, url: str, params: dict) -> dict:
         """Make an HTTP GET request with retry and exponential backoff.
@@ -53,146 +183,45 @@ class OpenMeteoClient(ConfigurableResource):
             Parsed JSON response as a dict.
 
         Raises:
-            httpx.HTTPStatusError: If the request fails after all retries.
-            httpx.TimeoutException: If the request times out after all retries.
+            OpenMeteoAPIError: Immediately for non-retryable API errors (e.g. an
+                invalid variable name), or after all retries for 429/5xx.
+            httpx.TransportError: If connection/timeout errors persist after all retries.
         """
-        last_exception = None
-
         for attempt in range(MAX_RETRIES):
             try:
-                with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-                    response = client.get(url, params=params)
-                    response.raise_for_status()
-                    return response.json()
-            except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
-                last_exception = e
-                if attempt < MAX_RETRIES - 1:
-                    wait_time = BACKOFF_FACTOR * (2**attempt)
-                    logger.warning(
-                        "Request to %s failed (attempt %d/%d): %s. Retrying in %.1fs...",
-                        url,
-                        attempt + 1,
-                        MAX_RETRIES,
-                        str(e),
-                        wait_time,
-                    )
-                    time.sleep(wait_time)
-                else:
-                    logger.error(
-                        "Request to %s failed after %d attempts: %s",
-                        url,
-                        MAX_RETRIES,
-                        str(e),
-                    )
+                return self._get(url, params)
+            except (httpx.TransportError, OpenMeteoAPIError) as e:
+                if not _is_retryable(e) or attempt == MAX_RETRIES - 1:
+                    logger.error("Request to %s failed: %s", url, e)
+                    raise
+                wait_time = BACKOFF_FACTOR * (2**attempt)
+                logger.warning(
+                    "Request to %s failed (attempt %d/%d): %s. Retrying in %.1fs...",
+                    url,
+                    attempt + 1,
+                    MAX_RETRIES,
+                    str(e),
+                    wait_time,
+                )
+                time.sleep(wait_time)
+        raise AssertionError("unreachable")
 
-        raise last_exception  # type: ignore[misc]
-
-    def fetch_forecast(
-        self,
-        latitude: float,
-        longitude: float,
-        hourly_variables: list[str],
-        forecast_days: int = 7,
-        temperature_unit: str = "celsius",
-        wind_speed_unit: str = "kmh",
-        precipitation_unit: str = "mm",
-        start_date: date | None = None,
-        end_date: date | None = None,
-    ) -> dict:
-        """Fetch forecast data for a single location.
+    def fetch(self, endpoint: Endpoint, request: OpenMeteoRequest) -> dict:
+        """Fetch raw data for a single location from the forecast or archive API.
 
         Args:
-            latitude: WGS84 latitude.
-            longitude: WGS84 longitude.
-            hourly_variables: List of Open-Meteo variable names.
-            forecast_days: Number of forecast days (1-16). Ignored when
-                start_date/end_date are given.
-            temperature_unit: Temperature unit (celsius/fahrenheit).
-            wind_speed_unit: Wind speed unit (kmh/ms/mph/kn).
-            precipitation_unit: Precipitation unit (mm/inch).
-            start_date: Optional explicit start date (e.g. a recent past day
-                not yet available in the archive).
-            end_date: Optional explicit end date; required with start_date.
+            endpoint: "forecast" (current/future, recent past) or "archive" (history).
+            request: The query description.
 
         Returns:
-            Raw JSON response dict from the Open-Meteo forecast API.
+            Raw JSON response dict.
         """
-        params = {
-            "latitude": latitude,
-            "longitude": longitude,
-            "hourly": ",".join(hourly_variables),
-            "temperature_unit": temperature_unit,
-            "wind_speed_unit": wind_speed_unit,
-            "precipitation_unit": precipitation_unit,
-            "timezone": API_TIMEZONE,
-        }
-        # Open-Meteo treats forecast_days and start_date/end_date as mutually exclusive
-        if start_date is not None and end_date is not None:
-            params["start_date"] = start_date.isoformat()
-            params["end_date"] = end_date.isoformat()
-        else:
-            params["forecast_days"] = forecast_days
-
+        url = self.base_url if endpoint == "forecast" else self.archive_url
         logger.info(
-            "Fetching forecast for (%.4f, %.4f) with %d variables",
-            latitude,
-            longitude,
-            len(hourly_variables),
+            "Fetching %s for (%.4f, %.4f): %s",
+            endpoint,
+            request.latitude,
+            request.longitude,
+            {s: len(getattr(request, s)) for s in SECTIONS if getattr(request, s)},
         )
-
-        return self._request_with_retry(self.base_url, params)
-
-    def fetch_historical(
-        self,
-        latitude: float,
-        longitude: float,
-        hourly_variables: list[str],
-        start_date: date,
-        end_date: date,
-        temperature_unit: str = "celsius",
-        wind_speed_unit: str = "kmh",
-        precipitation_unit: str = "mm",
-    ) -> dict:
-        """Fetch historical data from the archive API.
-
-        Args:
-            latitude: WGS84 latitude.
-            longitude: WGS84 longitude.
-            hourly_variables: List of Open-Meteo variable names.
-            start_date: Start date for the historical range.
-            end_date: End date for the historical range.
-            temperature_unit: Temperature unit (celsius/fahrenheit).
-            wind_speed_unit: Wind speed unit (kmh/ms/mph/kn).
-            precipitation_unit: Precipitation unit (mm/inch).
-
-        Returns:
-            Raw JSON response dict from the Open-Meteo archive API.
-
-        Note:
-            The archive API does NOT return precipitation_probability.
-            That variable will be absent from the response for historical data.
-        """
-        # Filter out forecast-only variables for the archive endpoint
-        archive_variables = [v for v in hourly_variables if v != "precipitation_probability"]
-
-        params = {
-            "latitude": latitude,
-            "longitude": longitude,
-            "hourly": ",".join(archive_variables),
-            "start_date": start_date.isoformat(),
-            "end_date": end_date.isoformat(),
-            "temperature_unit": temperature_unit,
-            "wind_speed_unit": wind_speed_unit,
-            "precipitation_unit": precipitation_unit,
-            "timezone": API_TIMEZONE,
-        }
-
-        logger.info(
-            "Fetching historical data for (%.4f, %.4f) from %s to %s",
-            latitude,
-            longitude,
-            start_date,
-            end_date,
-        )
-
-        return self._request_with_retry(self.archive_url, params)
+        return self._request_with_retry(url, request.to_query(endpoint))
