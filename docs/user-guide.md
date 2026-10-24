@@ -168,25 +168,34 @@ Wait for a line like `Serving dagster-webserver on http://127.0.0.1:3000`, then 
 - The startup message *"To persist information across sessions, set the environment variable DAGSTER_HOME"* is expected. It refers only to per-step stdout/stderr logs, which go to a temporary `.tmp_dagster_home_*` folder that's removed when Dagster stops.
 - To use another port: `dagster dev -p 3001`. If your browser can't reach WSL on localhost: `dagster dev -h 0.0.0.0`.
 
-In the UI you should see:
+### Finding your way around the UI
 
-| Item | Name |
-|---|---|
-| Assets (8) | `bronze_forecast`, `silver_hourly_weather`, `silver_daily_weather`, `gold_daily_temperature`, `gold_daily_precipitation`, `bronze_current`, `silver_current_weather`, `gold_current_conditions` |
-| Jobs | `weather_pipeline_job` (hourly + daily data), `current_weather_job` (current conditions) |
-| Schedules (off by default) | `hourly_weather_schedule` (every hour), `current_weather_schedule` (every 15 minutes) |
+> UI steps in this guide were checked against **Dagster 1.13.26** (`dagster --version`). Other versions move menus around. If yours differs, the names below should still be searchable.
 
-Use the search box (`Ctrl/Cmd + K`) to jump to any of these by name.
+The left sidebar has these pages (each has an `Alt`/`⌥` + letter shortcut):
+
+| Page | Shortcut | What you'll find there |
+|---|---|---|
+| **Overview** | ⌥O | Activity timeline of recent runs |
+| **Runs** | ⌥R | All runs; the **Backfills** tab lists backfills |
+| **Catalog** | ⌥C | The 8 assets: `bronze_forecast`, `silver_hourly_weather`, `silver_daily_weather`, `gold_daily_temperature`, `gold_daily_precipitation`, `bronze_current`, `silver_current_weather`, `gold_current_conditions` |
+| **Jobs** | ⌥J | `weather_pipeline_job` (hourly + daily data) and `current_weather_job` (current conditions) |
+| **Automation** | ⌥A | **Schedules and sensors**: `hourly_weather_schedule` and `current_weather_schedule`, both off by default |
+| **Lineage** | ⌥L | The asset graph (Bronze → Silver → Gold) |
+| **Deployment** | ⌥D | **Code locations** (reload code/config here) and daemon health |
+
+To jump to anything by name, press **`/`** (or **⌘K** on macOS) and type, e.g. `weather_pipeline_job`.
 
 ## 5. First run
 
 ### 5.1 Today's data
 
 **In the UI:**
-1. Open **`weather_pipeline_job`** (search for it).
-2. Click **Materialize all**.
-3. In the partition picker, select **today's date (UTC)** only, then **Launch run**.
-4. The run page shows each step turning green, followed by the quality checks: `bronze_file_exists_check`, `silver_quality_check`, `silver_daily_check` and `gold_temperature_check`.
+1. Go to **Jobs** (⌥J) → **`weather_pipeline_job`**. The **Overview** tab shows the job's asset graph.
+2. Click **Materialize all…** in the toolbar above the graph. A dialog opens.
+3. Under **Partition selection**, click **Latest**. That's today's partition (UTC), the last one in the range.
+4. Click **Launch 1 run**, then open the run from the confirmation (or via **Runs**, ⌥R).
+5. The run page shows each step turning green, followed by the quality checks: `bronze_file_exists_check`, `silver_quality_check`, `silver_daily_check` and `gold_temperature_check`.
 
 **Or from a second terminal** (virtual environment active):
 
@@ -203,19 +212,24 @@ dagster asset materialize -m weather_forecast.definitions \
 
 To load the last 30 days (`backfill_days`):
 
-1. Open **`weather_pipeline_job`** → **Materialize all**.
-2. Select the date range (for example the whole range), then **Launch backfill**.
-3. Follow progress on the backfill's page (also listed under **Runs**). Dagster runs up to 10 partitions at a time, so 30 days take a few minutes.
+1. Go to **Jobs** → **`weather_pipeline_job`** → **Materialize all…**.
+2. Under **Partition selection**, choose which days to load:
+   - **All**: every day in the range.
+   - **Missing**, or **Failed and missing**: only days not yet loaded (or that failed). Good for filling gaps later.
+   - **Custom**: drag across the partition bar to pick a range.
+3. Optionally tick **Backfill only failed and missing partitions within selection** under **Options**. If the dialog asks how to **Launch as…**, choose **Multiple runs (One per selected partition)**.
+4. Click **Launch backfill**. Once several partitions are selected, the button changes from **Launch 1 run** to this.
+5. Follow progress under **Runs → Backfills**; click the backfill to see each partition. Dagster runs up to 10 partitions at a time, so 30 days take a few minutes.
 
 Past days come from Open-Meteo's archive. The last day or two, which the archive doesn't have yet, come from the forecast API automatically.
 
-> Materializing only `bronze_forecast` doesn't update Silver or Gold. Always use the job (or "Materialize all"). The current-weather assets aren't in this job, by design.
+> Materializing a single asset from the **Catalog** (e.g. only `bronze_forecast`) doesn't update Silver or Gold. Use the job's **Materialize all…**. The current-weather assets aren't in this job, by design.
 
 ### 5.3 Current weather
 
 Current conditions are the forecast model's value for the current 15-minute slot, not a weather-station reading. They **can only be captured for today**, as they happen.
 
-- Run once now: open **`current_weather_job`** → **Materialize all** → today's partition → **Launch run**, or
+- Run once now: **Jobs** → **`current_weather_job`** → **Materialize all…** → **Partition selection: Latest** → **Launch 1 run**, or
 
   ```bash
   dagster asset materialize -m weather_forecast.definitions \
@@ -227,23 +241,28 @@ Current conditions are the forecast model's value for the current 15-minute slot
 
 ## 6. Turn on the schedules
 
-Schedules start **off**. Open the schedules list (the **Automation** page; on older Dagster versions **Overview → Schedules**) and switch on:
+Schedules start **off**. Go to **Automation** (⌥A) → **Schedules and sensors** and switch on the toggle next to each schedule:
 
 | Schedule | Runs | What it does |
 |---|---|---|
 | `hourly_weather_schedule` | every hour at :00 UTC | Refreshes today's forecast through Bronze → Silver → Gold |
 | `current_weather_schedule` | every 15 minutes (`current_interval_minutes`) | Adds a current-conditions snapshot and updates the latest-conditions table |
 
-Schedules only run while `dagster dev` is running. Snapshots missed while it's stopped can't be recovered later. The `gold_current_freshness_check` turns red if the latest snapshot is older than twice the interval, so a stopped scheduler shows up quickly.
+Clicking a schedule's name shows its upcoming and past ticks, and the runs each tick launched. Schedules only run while `dagster dev` is running. Snapshots missed while it's stopped can't be recovered later. The `gold_current_freshness_check` turns red if the latest snapshot is older than twice the interval, so a stopped scheduler shows up quickly.
 
 ## 7. Check the results
 
 ### In the UI
 
-Open an asset (e.g. `silver_hourly_weather`) to see:
-- Its partitions, coloured by status.
-- Metadata from the latest run: row counts, null percentages, the columns, and any `unsupported_variables`.
-- Quality-check results.
+Open an asset from **Catalog** (⌥C), or click it in **Lineage** (⌥L). Its tabs:
+
+| Tab | Shows |
+|---|---|
+| **Overview** | Latest materialization and its metadata: row counts, null percentages, the columns, any `unsupported_variables` |
+| **Partitions** | One cell per day, coloured by status; click a day for its details |
+| **Checks** | Quality-check results and history |
+| **Events** | Every materialization with its metadata |
+| **Lineage** | Upstream and downstream assets |
 
 Gold assets also show a preview table.
 
@@ -301,7 +320,7 @@ print(duckdb.sql(\"\"\"
 
 | Symptom | Cause | What to do |
 |---|---|---|
-| UI shows a red code-location error / `dagster definitions validate` fails | Config problem | Read the message; see [3.4](#34-validate-your-configuration). After fixing, click **Reload** on the code location (or restart `dagster dev`) |
+| UI shows a red code-location error / `dagster definitions validate` fails | Config problem | Read the message; see [3.4](#34-validate-your-configuration). After fixing, go to **Deployment** (⌥D) → **Code locations** → **Reload**, or click **Reload definitions** (top right); restarting `dagster dev` also works |
 | Run fails with `Open-Meteo API error 400: … invalid String value <name>` | Misspelt variable, or it's in the wrong section | Fix the name in `variables.yaml` (check the right section in the Open-Meteo docs) |
 | Run fails with `Open-Meteo API error 429` or `5xx` after retries | Rate limit or API outage (calls are retried 3 times) | Wait and re-run; reduce cities or poll frequency if it's 429 |
 | Some columns are completely empty for past days | Forecast-only variable (e.g. `precipitation_probability`, `uv_index`) | Expected; see the asset's `unsupported_variables` metadata |

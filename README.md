@@ -120,7 +120,7 @@ Open-Meteo API
 | `hourly_weather_schedule` | `weather_pipeline_job` | every hour at `:00` UTC | Bronze → Silver (hourly + daily) → Gold for **today's UTC partition**, refreshing the latest forecast |
 | `current_weather_schedule` | `current_weather_job` | every `current_interval_minutes` (default 15) | Snapshot of current conditions → Silver history → `gold_current_conditions` |
 
-Turn them on from the schedules list in the Dagster UI (the **Automation** page; **Overview → Schedules** on older versions). Schedules start stopped.
+Turn them on in the Dagster UI under **Automation → Schedules and sensors**. Schedules start stopped. UI steps are for Dagster 1.13; see the [User Guide](docs/user-guide.md#finding-your-way-around-the-ui).
 
 Partitions are **UTC calendar days**: in Adelaide (UTC+10:30) the `2026-10-24` partition covers
 10:30 on the 24th to 09:30 on the 25th, local time. Each hourly Silver row has both
@@ -154,7 +154,7 @@ every layer:
 
 1. Open http://localhost:3000
 2. Navigate to **Jobs** → `weather_pipeline_job`
-3. Click **Materialize all** → **Select partitions** → choose the date range → **Launch backfill**
+3. Click **Materialize all…** → under **Partition selection** choose **All** (or **Missing**) → **Launch backfill**
 4. Each partition runs Bronze → Silver → Gold. Past days use the archive API; recent days the
    archive doesn't have yet fall back to the forecast API automatically
 
