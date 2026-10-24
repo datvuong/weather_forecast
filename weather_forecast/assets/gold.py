@@ -18,7 +18,9 @@ File layout:
 """
 
 import logging
+from pathlib import Path
 
+import duckdb
 import pandas as pd
 from dagster import (
     AssetCheckResult,
@@ -31,8 +33,8 @@ from dagster import (
 from weather_forecast.assets.silver import silver_hourly_weather, silver_path
 from weather_forecast.models.weather import VariablesConfig
 from weather_forecast.partitions import daily_partitions
-from weather_forecast.resources.duckdb_resource import DuckDBResource
-from weather_forecast.utils.helpers import get_data_dir, load_locations_config
+from weather_forecast.resources.duckdb_resource import DuckDBResource, ensure_table
+from weather_forecast.utils.helpers import fill_location_ids, get_data_dir, load_locations_config
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +81,102 @@ def validate_gold_requirements(config: VariablesConfig) -> None:
         )
 
 
+TEMPERATURE_COLUMNS = {
+    "location_id": "VARCHAR",
+    "location_name": "VARCHAR",
+    "date": "VARCHAR",
+    "temp_min_c": "DOUBLE",
+    "temp_max_c": "DOUBLE",
+    "temp_avg_c": "DOUBLE",
+    "daytime_temp_min_c": "DOUBLE",
+    "daytime_temp_max_c": "DOUBLE",
+    "humidity_avg_pct": "DOUBLE",
+    "wind_max_kmh": "DOUBLE",
+    "uv_max": "DOUBLE",
+}
+
+PRECIPITATION_COLUMNS = {
+    "location_id": "VARCHAR",
+    "location_name": "VARCHAR",
+    "date": "VARCHAR",
+    "total_precipitation_mm": "DOUBLE",
+    "max_precip_probability_pct": "DOUBLE",
+    "avg_precip_probability_pct": "DOUBLE",
+    "rainy_hours": "INTEGER",
+    "total_hours": "INTEGER",
+    "pct_hours_with_rain": "DOUBLE",
+}
+
+GOLD_KEY = ["location_id", "date"]
+
+
+def gold_path(metric: str, partition_date: str) -> Path:
+    """Return the Gold Parquet path of a metric for a partition date."""
+    return get_data_dir() / "gold" / metric / f"{partition_date}.parquet"
+
+
+def _load_hourly(context: AssetExecutionContext) -> pd.DataFrame | None:
+    """Load the Silver hourly rows the partition aggregates (None if missing).
+
+    Rows from files written before location_id existed get it from config.
+    """
+    silver_file = silver_path("hourly", context.partition_key)
+    if not silver_file.exists():
+        context.log.warning(f"Silver file not found for {context.partition_key}, skipping Gold")
+        return None
+    return fill_location_ids(pd.read_parquet(str(silver_file)))
+
+
+def _write_gold(
+    context: AssetExecutionContext,
+    duckdb_resource: DuckDBResource,
+    table: str,
+    columns: dict[str, str],
+    result_df: pd.DataFrame,
+) -> None:
+    """Upsert a partition's rows into DuckDB and write its Parquet file."""
+    partition_date_str = context.partition_key
+    result_df = result_df[list(columns)]
+
+    with duckdb_resource.get_connection() as conn:
+        if ensure_table(conn, table, columns, GOLD_KEY):
+            context.log.warning(f"{table} schema changed; table recreated (re-run the backfill)")
+        # Upsert: delete existing records for this partition, then insert
+        conn.execute(f"DELETE FROM {table} WHERE date = ?", [partition_date_str])
+        conn.execute(f"INSERT INTO {table} BY NAME SELECT * FROM result_df")
+
+    output_path = gold_path(table.removeprefix("gold_"), partition_date_str)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    result_df.to_parquet(str(output_path), compression="snappy", index=False)
+
+    context.add_output_metadata(
+        {
+            "partition_date": partition_date_str,
+            "locations": MetadataValue.text(", ".join(result_df["location_name"].tolist())),
+            "rows": len(result_df),
+            "preview": MetadataValue.md(result_df.to_markdown(index=False)),
+        }
+    )
+    context.log.info(f"{table}: {len(result_df)} rows for {partition_date_str}")
+
+
+def _aggregate(hourly: pd.DataFrame, select_sql: str, partition_date: str) -> pd.DataFrame:
+    """Run a per-location aggregation over the hourly rows with DuckDB."""
+    sql = f"""
+        SELECT
+            location_id,
+            location_name,
+            '{partition_date}' AS date,
+            {select_sql}
+        FROM hourly
+        GROUP BY location_id, location_name
+        ORDER BY location_id
+    """
+    with duckdb.connect() as conn:
+        conn.register("hourly", hourly)
+        return conn.execute(sql).fetchdf()
+
+
 @asset(
     partitions_def=daily_partitions,
     group_name="gold",
@@ -92,7 +190,7 @@ def gold_daily_temperature(
 ) -> None:
     """Compute daily temperature and related weather aggregations.
 
-    Reads the Silver layer Parquet file for this partition date and computes:
+    Aggregates the Silver hourly rows for this partition:
     - Min/max/avg temperature (24h and daytime 6am-6pm)
     - Average humidity
     - Max wind speed
@@ -100,19 +198,12 @@ def gold_daily_temperature(
 
     Results are written to both Parquet and DuckDB.
     """
-    partition_date_str = context.partition_key
-    data_dir = get_data_dir()
-    silver_file = silver_path("hourly", partition_date_str)
-
-    if not silver_file.exists():
-        context.log.warning(f"Silver file not found for {partition_date_str}, skipping Gold")
+    hourly = _load_hourly(context)
+    if hourly is None:
         return
-
-    # Use DuckDB to query the Silver Parquet directly
-    sql = f"""
-        SELECT
-            location_name,
-            '{partition_date_str}' AS date,
+    result_df = _aggregate(
+        hourly,
+        """
             MIN(temperature_2m) AS temp_min_c,
             MAX(temperature_2m) AS temp_max_c,
             ROUND(AVG(temperature_2m), 2) AS temp_avg_c,
@@ -123,58 +214,13 @@ def gold_daily_temperature(
             ROUND(AVG(relative_humidity_2m), 2) AS humidity_avg_pct,
             MAX(wind_speed_10m) AS wind_max_kmh,
             MAX(uv_index) AS uv_max
-        FROM read_parquet('{silver_file}')
-        GROUP BY location_name
-        ORDER BY location_name
-    """
-
-    with duckdb_resource.get_connection() as conn:
-        result_df = conn.execute(sql).fetchdf()
-
-        if result_df.empty:
-            context.log.warning(f"No temperature data for {partition_date_str}")
-            return
-
-        # Ensure Gold DuckDB table exists
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS gold_daily_temperature (
-                location_name VARCHAR,
-                date VARCHAR,
-                temp_min_c DOUBLE,
-                temp_max_c DOUBLE,
-                temp_avg_c DOUBLE,
-                daytime_temp_min_c DOUBLE,
-                daytime_temp_max_c DOUBLE,
-                humidity_avg_pct DOUBLE,
-                wind_max_kmh DOUBLE,
-                uv_max DOUBLE,
-                PRIMARY KEY (location_name, date)
-            )
-        """)
-
-        # Upsert: delete existing records for this partition, then insert
-        conn.execute(
-            "DELETE FROM gold_daily_temperature WHERE date = ?",
-            [partition_date_str],
-        )
-        conn.execute("INSERT INTO gold_daily_temperature SELECT * FROM result_df")
-
-    # Also write to Parquet
-    gold_temp_dir = data_dir / "gold" / "daily_temperature"
-    gold_temp_dir.mkdir(parents=True, exist_ok=True)
-    output_path = gold_temp_dir / f"{partition_date_str}.parquet"
-    result_df.to_parquet(str(output_path), compression="snappy", index=False)
-
-    context.add_output_metadata(
-        {
-            "partition_date": partition_date_str,
-            "locations": MetadataValue.text(", ".join(result_df["location_name"].tolist())),
-            "rows": len(result_df),
-            "preview": MetadataValue.md(result_df.to_markdown(index=False)),
-        }
+        """,
+        context.partition_key,
     )
-
-    context.log.info(f"Gold temperature: {len(result_df)} rows for {partition_date_str}")
+    if result_df.empty:
+        context.log.warning(f"No temperature data for {context.partition_key}")
+        return
+    _write_gold(context, duckdb_resource, "gold_daily_temperature", TEMPERATURE_COLUMNS, result_df)
 
 
 @asset(
@@ -190,23 +236,17 @@ def gold_daily_precipitation(
 ) -> None:
     """Compute daily precipitation aggregations.
 
-    Reads the Silver layer Parquet file for this partition date and computes:
+    Aggregates the Silver hourly rows for this partition:
     - Total precipitation (mm)
     - Max and average precipitation probability
     - Number of rainy hours and percentage
     """
-    partition_date_str = context.partition_key
-    data_dir = get_data_dir()
-    silver_file = silver_path("hourly", partition_date_str)
-
-    if not silver_file.exists():
-        context.log.warning(f"Silver file not found for {partition_date_str}, skipping Gold")
+    hourly = _load_hourly(context)
+    if hourly is None:
         return
-
-    sql = f"""
-        SELECT
-            location_name,
-            '{partition_date_str}' AS date,
+    result_df = _aggregate(
+        hourly,
+        """
             ROUND(COALESCE(SUM(precipitation), 0), 2) AS total_precipitation_mm,
             MAX(precipitation_probability) AS max_precip_probability_pct,
             ROUND(AVG(precipitation_probability), 2) AS avg_precip_probability_pct,
@@ -216,56 +256,15 @@ def gold_daily_precipitation(
                 COUNT(*) FILTER (WHERE precipitation > 0) * 100.0 / NULLIF(COUNT(*), 0),
                 1
             ) AS pct_hours_with_rain
-        FROM read_parquet('{silver_file}')
-        GROUP BY location_name
-        ORDER BY location_name
-    """
-
-    with duckdb_resource.get_connection() as conn:
-        result_df = conn.execute(sql).fetchdf()
-
-        if result_df.empty:
-            context.log.warning(f"No precipitation data for {partition_date_str}")
-            return
-
-        # Ensure Gold DuckDB table exists
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS gold_daily_precipitation (
-                location_name VARCHAR,
-                date VARCHAR,
-                total_precipitation_mm DOUBLE,
-                max_precip_probability_pct DOUBLE,
-                avg_precip_probability_pct DOUBLE,
-                rainy_hours INTEGER,
-                total_hours INTEGER,
-                pct_hours_with_rain DOUBLE,
-                PRIMARY KEY (location_name, date)
-            )
-        """)
-
-        # Upsert: delete existing records for this partition, then insert
-        conn.execute(
-            "DELETE FROM gold_daily_precipitation WHERE date = ?",
-            [partition_date_str],
-        )
-        conn.execute("INSERT INTO gold_daily_precipitation SELECT * FROM result_df")
-
-    # Also write to Parquet
-    gold_precip_dir = data_dir / "gold" / "daily_precipitation"
-    gold_precip_dir.mkdir(parents=True, exist_ok=True)
-    output_path = gold_precip_dir / f"{partition_date_str}.parquet"
-    result_df.to_parquet(str(output_path), compression="snappy", index=False)
-
-    context.add_output_metadata(
-        {
-            "partition_date": partition_date_str,
-            "locations": MetadataValue.text(", ".join(result_df["location_name"].tolist())),
-            "rows": len(result_df),
-            "preview": MetadataValue.md(result_df.to_markdown(index=False)),
-        }
+        """,
+        context.partition_key,
     )
-
-    context.log.info(f"Gold precipitation: {len(result_df)} rows for {partition_date_str}")
+    if result_df.empty:
+        context.log.warning(f"No precipitation data for {context.partition_key}")
+        return
+    _write_gold(
+        context, duckdb_resource, "gold_daily_precipitation", PRECIPITATION_COLUMNS, result_df
+    )
 
 
 @asset_check(
@@ -275,7 +274,7 @@ def gold_daily_precipitation(
 def gold_temperature_check(context) -> AssetCheckResult:
     """Validate Gold daily temperature aggregations."""
     partition_date_str = context.partition_key
-    gold_file = get_data_dir() / "gold" / "daily_temperature" / f"{partition_date_str}.parquet"
+    gold_file = gold_path("daily_temperature", partition_date_str)
 
     if not gold_file.exists():
         return AssetCheckResult(
@@ -291,9 +290,10 @@ def gold_temperature_check(context) -> AssetCheckResult:
     if len(df) != expected_rows:
         issues.append(f"Row count {len(df)} != {expected_rows} configured locations")
 
-    # Check no null primary keys
-    if df["location_name"].isna().any():
-        issues.append("Null location_name found")
+    # Check no null keys
+    for key in ("location_id", "location_name"):
+        if key not in df.columns or df[key].isna().any():
+            issues.append(f"Null or missing {key} found")
     if df["date"].isna().any():
         issues.append("Null date found")
 

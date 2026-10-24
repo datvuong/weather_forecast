@@ -48,6 +48,7 @@ from weather_forecast.resources.api_client import unsupported_variables
 from weather_forecast.utils.helpers import (
     daily_epoch_to_date,
     epoch_to_utc,
+    fill_location_ids,
     get_data_dir,
     load_locations_config,
     load_variables_config,
@@ -57,9 +58,9 @@ logger = logging.getLogger(__name__)
 
 # Columns identifying one record per section (deduplication keys)
 SECTION_KEYS: dict[str, list[str]] = {
-    "hourly": ["location_name", "timestamp_utc"],
-    "daily": ["location_name", "date_local"],
-    "current": ["location_name", "observed_at_utc"],
+    "hourly": ["location_id", "timestamp_utc"],
+    "daily": ["location_id", "date_local"],
+    "current": ["location_id", "observed_at_utc"],
 }
 
 # A raw API response with its location and Bronze ingestion time
@@ -177,6 +178,7 @@ def parse_section(
             continue
 
         record = {
+            "location_id": location.id,
             "location_name": location.name,
             "latitude": raw_json.get("latitude", location.latitude),
             "longitude": raw_json.get("longitude", location.longitude),
@@ -455,10 +457,10 @@ def silver_daily_check(context) -> AssetCheckResult:
         return _missing_file_result(silver_file, partition_date_str)
 
     df = pd.read_parquet(str(silver_file))
-    expected = sorted(loc.name for loc in load_locations_config())
+    expected = sorted(loc.id for loc in load_locations_config())
     issues: list[str] = []
 
-    found = sorted(df["location_name"])
+    found = sorted(fill_location_ids(df)["location_id"])
     if found != expected:
         issues.append(f"Expected one row per location {expected}, found {found}")
     issues += range_issues(df, load_variables_config().daily_variables)

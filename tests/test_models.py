@@ -24,6 +24,7 @@ from weather_forecast.utils.helpers import (
 
 def _record(**overrides):
     base = {
+        "location_id": "adelaide",
         "location_name": "Adelaide",
         "latitude": -34.9,
         "longitude": 138.6,
@@ -250,6 +251,7 @@ class TestBuildRecordModel:
     def test_time_valued_variable_parses_epoch(self):
         model = build_record_model("daily", {"sunrise": "time", "precipitation_sum": "float"})
         rec = model(
+            location_id="adelaide",
             location_name="Adelaide",
             latitude=-34.9,
             longitude=138.6,

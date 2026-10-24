@@ -179,6 +179,9 @@ class TestSilverHourly:
         assert df["precipitation_probability"].isna().all()
         assert df["uv_index"].isna().sum() == 6 * len(locations)
         assert (df["ingestion_timestamp"] == pd.Timestamp(INGESTED)).all()
+        assert dict(zip(df["location_name"], df["location_id"])) == {
+            loc.name: loc.id for loc in locations
+        }
         metadata = result.asset_materializations_for_node("silver_hourly_weather")[0].metadata
         assert metadata["unsupported_variables"].value == {
             loc.name: ["precipitation_probability"] for loc in locations

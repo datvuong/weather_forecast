@@ -54,6 +54,7 @@ from weather_forecast.resources.api_client import (
 from weather_forecast.resources.duckdb_resource import DuckDBResource
 from weather_forecast.utils.helpers import (
     epoch_to_utc,
+    fill_location_ids,
     get_data_dir,
     load_locations_config,
     load_variables_config,
@@ -206,6 +207,8 @@ def gold_current_conditions(
         if (path := silver_path("current", day.isoformat())).exists()
     ]
     history = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not history.empty:
+        history = fill_location_ids(history)  # files from before location_id existed
     if history.empty:
         context.log.warning("No current-weather snapshots found; keeping previous conditions")
         context.add_output_metadata({"rows": 0})
@@ -213,9 +216,9 @@ def gold_current_conditions(
 
     latest = (
         history.sort_values("observed_at_utc", kind="stable")
-        .groupby("location_name")
+        .groupby("location_id")
         .tail(1)
-        .sort_values("location_name")
+        .sort_values("location_id")
         .reset_index(drop=True)
     )
     now = pd.Timestamp.now(tz="UTC")

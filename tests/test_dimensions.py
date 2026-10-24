@@ -1,21 +1,28 @@
-"""Tests for dimension assets: dim_weather_code and the weather code coverage checks."""
+"""Tests for dimension assets: dim_weather_code, dim_location and their checks."""
 
 import dagster as dg
 import pandas as pd
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from tests.conftest import make_api_response, write_bronze_file
 from weather_forecast.assets.bronze import bronze_forecast
 from weather_forecast.assets.dimensions import (
     daily_weather_code_check,
+    dim_location,
+    dim_location_check,
     dim_weather_code,
     dimension_path,
     hourly_weather_code_check,
 )
 from weather_forecast.assets.silver import silver_daily_weather, silver_hourly_weather
 from weather_forecast.models.weather import WeatherCodesConfig
-from weather_forecast.utils.helpers import load_weather_codes
+from weather_forecast.utils.helpers import (
+    _get_config_dir,
+    load_locations_config,
+    load_weather_codes,
+)
 
 INGESTED = pd.Timestamp("2026-10-24", tz="UTC").to_pydatetime()
 
@@ -138,3 +145,90 @@ def test_coverage_check_fails_for_unknown_code(data_dir, locations, past_date):
     assert not evaluation.passed
     assert evaluation.metadata["unknown_codes"].value == [42]
     assert "config/weather_codes.yaml" in evaluation.description
+
+
+def _run_dim_location(duckdb_resource):
+    return dg.materialize(
+        [bronze_forecast, dim_location, dim_location_check],
+        selection=dg.AssetSelection.assets(dim_location) | dg.AssetSelection.checks(
+            dim_location_check
+        ),
+        resources={"duckdb_resource": duckdb_resource, "open_meteo_client": None},
+    )
+
+
+class TestDimLocation:
+    def test_config_attributes_and_api_grid(self, data_dir, duckdb_resource, locations, past_date):
+        raw = make_api_response(past_date)
+        raw.update(latitude=-34.90334, longitude=138.5406, elevation=46.0)
+        write_bronze_file(data_dir, "Adelaide", past_date.isoformat(), [(raw, INGESTED)])
+
+        result = _run_dim_location(duckdb_resource)
+
+        assert result.success
+        df = duckdb_resource.query("SELECT * FROM dim_location").set_index("location_id")
+        adelaide = df.loc["adelaide"]
+        assert (adelaide["location_name"], adelaide["region"]) == ("Adelaide", "South Australia")
+        assert list(adelaide["tags"]) == ["capital"]
+        assert (adelaide["grid_latitude"], adelaide["elevation_m"]) == (-34.90334, 46.0)
+        assert adelaide["latitude"] == -34.9285  # configured coordinates kept alongside
+        assert adelaide["utc_offset_minutes"] in (570, 630)  # ACST / ACDT
+        assert pd.isna(df.loc["melbourne", "elevation_m"])  # no Bronze file yet
+        assert df["is_active"].all()
+        [evaluation] = result.get_asset_check_evaluations()
+        # Missing grid data for Melbourne is a warning, not an error
+        assert not evaluation.passed
+        assert evaluation.severity == dg.AssetCheckSeverity.WARN
+        assert evaluation.metadata["locations_without_grid_data"].value == ["melbourne"]
+
+    def test_uses_latest_bronze_file(self, data_dir, duckdb_resource, past_date):
+        for days_back, elevation in ((1, 40.0), (0, 46.0)):
+            raw = make_api_response(past_date)
+            raw["elevation"] = elevation
+            day = (past_date - pd.Timedelta(days=days_back)).isoformat()
+            write_bronze_file(data_dir, "Adelaide", day, [(raw, INGESTED)])
+
+        _run_dim_location(duckdb_resource)
+
+        elevation = duckdb_resource.query(
+            "SELECT elevation_m FROM dim_location WHERE location_id = 'adelaide'"
+        )
+        assert elevation["elevation_m"].item() == 46.0
+
+    def test_removed_location_kept_inactive(self, data_dir, duckdb_resource, variables_config):
+        _run_dim_location(duckdb_resource)
+        # Drop Melbourne from the (temp) config and rebuild
+        path = _get_config_dir() / "locations.yaml"
+        raw = yaml.safe_load(path.read_text())
+        raw["locations"] = [loc for loc in raw["locations"] if loc["id"] != "melbourne"]
+        path.write_text(yaml.safe_dump(raw))
+        load_locations_config.cache_clear()
+
+        result = _run_dim_location(duckdb_resource)
+
+        df = duckdb_resource.query(
+            "SELECT location_id, is_active FROM dim_location ORDER BY location_id"
+        )
+        assert df.to_dict("records") == [
+            {"location_id": "adelaide", "is_active": True},
+            {"location_id": "melbourne", "is_active": False},
+        ]
+        [evaluation] = result.get_asset_check_evaluations()
+        assert evaluation.metadata["locations_without_grid_data"].value == ["adelaide"]
+
+    def test_check_fails_when_configured_location_missing(self, data_dir, duckdb_resource):
+        _run_dim_location(duckdb_resource)
+        # Simulate a stale table that lacks a configured location
+        path = dimension_path("dim_location")
+        df = pd.read_parquet(path)
+        df[df["location_id"] != "adelaide"].to_parquet(path)
+
+        evaluation = dg.materialize(
+            [bronze_forecast, dim_location, dim_location_check],
+            selection=dg.AssetSelection.checks(dim_location_check),
+            resources={"duckdb_resource": duckdb_resource, "open_meteo_client": None},
+        ).get_asset_check_evaluations()[0]
+
+        assert not evaluation.passed
+        assert evaluation.severity == dg.AssetCheckSeverity.ERROR
+        assert "adelaide" in evaluation.description

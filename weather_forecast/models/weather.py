@@ -307,6 +307,7 @@ Section = Literal["hourly", "daily", "current"]
 # Key columns of each Silver table, in output order (variables follow, then metadata)
 SILVER_KEY_FIELDS: dict[str, dict[str, type]] = {
     "hourly": {
+        "location_id": str,
         "location_name": str,
         "latitude": float,
         "longitude": float,
@@ -314,12 +315,14 @@ SILVER_KEY_FIELDS: dict[str, dict[str, type]] = {
         "timestamp_local": datetime,
     },
     "daily": {
+        "location_id": str,
         "location_name": str,
         "latitude": float,
         "longitude": float,
         "date_local": date,
     },
     "current": {
+        "location_id": str,
         "location_name": str,
         "latitude": float,
         "longitude": float,

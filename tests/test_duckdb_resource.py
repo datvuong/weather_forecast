@@ -4,6 +4,7 @@ import duckdb
 import pytest
 
 from weather_forecast.resources import duckdb_resource as module
+from weather_forecast.resources.duckdb_resource import ensure_table
 
 
 @pytest.fixture(autouse=True)
@@ -55,3 +56,27 @@ def test_other_io_errors_are_not_retried(duckdb_resource, monkeypatch):
     with pytest.raises(duckdb.IOException, match="Permission denied"):
         duckdb_resource.query("SELECT 1")
     assert len(attempts) == 1
+
+
+class TestEnsureTable:
+    COLUMNS = {"id": "VARCHAR", "date": "VARCHAR", "value": "DOUBLE"}
+
+    def test_creates_missing_table(self, duckdb_resource):
+        with duckdb_resource.get_connection() as conn:
+            assert ensure_table(conn, "t", self.COLUMNS, ["id", "date"]) is False
+            assert [r[0] for r in conn.execute("DESCRIBE t").fetchall()] == list(self.COLUMNS)
+
+    def test_keeps_matching_table_and_rows(self, duckdb_resource):
+        with duckdb_resource.get_connection() as conn:
+            ensure_table(conn, "t", self.COLUMNS, ["id", "date"])
+            conn.execute("INSERT INTO t VALUES ('a', '2026-10-01', 1.0)")
+            assert ensure_table(conn, "t", self.COLUMNS, ["id", "date"]) is False
+            assert conn.execute("SELECT count(*) FROM t").fetchone()[0] == 1
+
+    def test_recreates_table_with_different_columns(self, duckdb_resource):
+        with duckdb_resource.get_connection() as conn:
+            conn.execute("CREATE TABLE t (date VARCHAR, value DOUBLE)")
+            conn.execute("INSERT INTO t VALUES ('2026-10-01', 1.0)")
+            assert ensure_table(conn, "t", self.COLUMNS, ["id", "date"]) is True
+            assert [r[0] for r in conn.execute("DESCRIBE t").fetchall()] == list(self.COLUMNS)
+            assert conn.execute("SELECT count(*) FROM t").fetchone()[0] == 0

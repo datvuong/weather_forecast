@@ -85,3 +85,47 @@ class DuckDBResource(ConfigurableResource):
             result = conn.execute(sql).fetchdf()
             logger.debug("Query returned %d rows", len(result))
             return result
+
+
+def ensure_table(
+    conn: duckdb.DuckDBPyConnection,
+    name: str,
+    columns: dict[str, str],
+    primary_key: list[str],
+) -> bool:
+    """Create a table, or recreate it if its columns differ from `columns`.
+
+    Meant for derived tables (Gold) that can be rebuilt from upstream data:
+    a schema change drops the old rows, which the next (back)fill rewrites.
+
+    Args:
+        conn: Open DuckDB connection.
+        name: Table name.
+        columns: Column name -> DuckDB type, in table order.
+        primary_key: Primary key columns.
+
+    Returns:
+        True if an existing table was dropped and recreated.
+    """
+    existing = [
+        row[0]
+        for row in conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = ? ORDER BY ordinal_position",
+            [name],
+        ).fetchall()
+    ]
+    recreated = bool(existing) and existing != list(columns)
+    if recreated:
+        logger.warning(
+            "Schema of %s changed (%s -> %s); recreating it. Re-run the backfill to refill it.",
+            name,
+            existing,
+            list(columns),
+        )
+        conn.execute(f"DROP TABLE {name}")
+    column_sql = ", ".join(f"{col} {type_}" for col, type_ in columns.items())
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {name} ({column_sql}, PRIMARY KEY ({', '.join(primary_key)}))"
+    )
+    return recreated

@@ -17,7 +17,7 @@ from weather_forecast.assets.silver import section_columns, silver_hourly_weathe
 from weather_forecast.utils.helpers import load_variables_config
 
 
-def _write_silver(data_dir, locations, partition_date):
+def _write_silver(data_dir, locations, partition_date, with_location_id=True):
     """Write a Silver file where location i has temperature = 10*i + hour/2."""
     rows = []
     start = datetime.combine(partition_date, datetime.min.time(), tzinfo=timezone.utc)
@@ -26,6 +26,7 @@ def _write_silver(data_dir, locations, partition_date):
             ts_utc = start + timedelta(hours=h)
             rows.append(
                 {
+                    "location_id": loc.id if with_location_id else None,
                     "location_name": loc.name,
                     "latitude": loc.latitude,
                     "longitude": loc.longitude,
@@ -165,3 +166,43 @@ class TestGoldRequirements:
 
         with pytest.raises(ValueError, match="temperature_unit='celsius', got 'fahrenheit'"):
             validate_gold_requirements(config)
+
+
+def test_gold_tables_carry_location_id(
+    data_dir, duckdb_resource, locations, past_date, silver_df
+):
+    _materialize(past_date.isoformat(), duckdb_resource)
+
+    for table in ("gold_daily_temperature", "gold_daily_precipitation"):
+        ids = duckdb_resource.query(f"SELECT location_id FROM {table} ORDER BY 1")["location_id"]
+        assert ids.tolist() == sorted(loc.id for loc in locations)
+
+
+def test_old_silver_without_location_id_is_filled_from_config(
+    data_dir, duckdb_resource, locations, past_date
+):
+    _write_silver(data_dir, locations, past_date, with_location_id=False)
+
+    result = _materialize(past_date.isoformat(), duckdb_resource)
+
+    assert result.success
+    ids = duckdb_resource.query("SELECT location_id FROM gold_daily_temperature ORDER BY 1")
+    assert ids["location_id"].tolist() == sorted(loc.id for loc in locations)
+
+
+def test_outdated_gold_table_is_recreated(
+    data_dir, duckdb_resource, locations, past_date, silver_df
+):
+    # A table from before location_id existed
+    duckdb_resource.execute(
+        "CREATE TABLE gold_daily_temperature (location_name VARCHAR, date VARCHAR, "
+        "temp_max_c DOUBLE, PRIMARY KEY (location_name, date))"
+    )
+    duckdb_resource.execute("INSERT INTO gold_daily_temperature VALUES ('Old', '2000-01-01', 1.0)")
+
+    result = _materialize(past_date.isoformat(), duckdb_resource)
+
+    assert result.success
+    df = duckdb_resource.query("SELECT * FROM gold_daily_temperature")
+    assert list(df.columns)[:3] == ["location_id", "location_name", "date"]
+    assert "Old" not in set(df["location_name"])  # derived rows are rebuilt by the backfill

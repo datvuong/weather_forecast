@@ -18,6 +18,8 @@ from weather_forecast.assets.current import (
 from weather_forecast.assets.dimensions import (
     current_weather_code_check,
     daily_weather_code_check,
+    dim_location,
+    dim_location_check,
     dim_weather_code,
     hourly_weather_code_check,
 )
@@ -62,6 +64,7 @@ defs = dg.Definitions(
         silver_current_weather,
         gold_current_conditions,
         dim_weather_code,
+        dim_location,
     ],
     asset_checks=[
         bronze_file_exists_check,
@@ -73,6 +76,7 @@ defs = dg.Definitions(
         hourly_weather_code_check,
         daily_weather_code_check,
         current_weather_code_check,
+        dim_location_check,
     ],
     jobs=[weather_pipeline_job, current_weather_job],
     schedules=[hourly_weather_schedule, current_weather_schedule],

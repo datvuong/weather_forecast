@@ -15,6 +15,7 @@ from weather_forecast.models.weather import (
     LocationsConfig,
     VariablesConfig,
     WeatherCodesConfig,
+    slugify,
 )
 
 logger = logging.getLogger(__name__)
@@ -213,3 +214,20 @@ def warn_if_over_api_budget(num_locations: int, config: VariablesConfig) -> int:
             API_DAILY_CALL_LIMIT,
         )
     return calls
+
+
+def fill_location_ids(df):
+    """Fill missing location_id values from location_name (in place-safe copy).
+
+    Silver files written before location_id existed lack the column. Ids come
+    from the configured locations, or a slug of the name for locations no
+    longer configured.
+    """
+    df = df.copy()
+    by_name = {loc.name: loc.id for loc in load_locations_config()}
+    fallback = df["location_name"].map(lambda n: by_name.get(n, slugify(n)))
+    if "location_id" not in df.columns:
+        df.insert(0, "location_id", fallback)
+    else:
+        df["location_id"] = df["location_id"].fillna(fallback)
+    return df
