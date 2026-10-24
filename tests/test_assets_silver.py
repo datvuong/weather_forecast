@@ -75,11 +75,11 @@ class TestParseHourlyData:
     def test_empty_response(self):
         assert _parse({"hourly": {}}) == []
 
-    def test_rejects_non_utc_response(self):
+    def test_rejects_non_unixtime_response(self):
         raw = make_api_response(date(2026, 10, 21))
-        raw["utc_offset_seconds"] = 37800
+        raw["hourly_units"]["time"] = "iso8601"
 
-        with pytest.raises(ValueError, match="UTC"):
+        with pytest.raises(ValueError, match="unixtime"):
             _parse(raw)
 
 

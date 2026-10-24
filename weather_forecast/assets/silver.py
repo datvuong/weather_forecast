@@ -11,7 +11,7 @@ File layout:
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -28,7 +28,7 @@ from dagster import (
 from weather_forecast.assets.bronze import bronze_forecast
 from weather_forecast.models.weather import HourlyWeatherRecord
 from weather_forecast.partitions import daily_partitions
-from weather_forecast.utils.helpers import get_data_dir, load_locations_config
+from weather_forecast.utils.helpers import epoch_to_utc, get_data_dir, load_locations_config
 
 logger = logging.getLogger(__name__)
 
@@ -79,9 +79,9 @@ def _parse_hourly_data(
 ) -> list[dict[str, Any]]:
     """Parse Open-Meteo hourly JSON response into flat records.
 
-    The API is queried with UTC timestamps (see api_client.API_TIMEZONE), so
-    hourly times are filtered against the UTC partition date and converted to
-    the location's local time for timestamp_local.
+    Bronze requests unixtime timestamps, so hourly times are exact UTC epochs.
+    They are filtered against the UTC partition date and converted to the
+    location's local time for timestamp_local.
 
     Args:
         raw_json: Parsed API response JSON.
@@ -101,20 +101,18 @@ def _parse_hourly_data(
     if not timestamps:
         return []
 
-    utc_offset = raw_json.get("utc_offset_seconds", 0)
-    if utc_offset != 0:
-        raise ValueError(
-            f"Expected UTC timestamps from API, got utc_offset_seconds={utc_offset}"
-        )
+    time_format = raw_json.get("hourly_units", {}).get("time")
+    if time_format != "unixtime":
+        raise ValueError(f"Expected unixtime hourly timestamps from API, got {time_format!r}")
     tz = ZoneInfo(local_timezone)
 
     records = []
-    for i, ts_str in enumerate(timestamps):
-        # Only include records that belong to this partition date
-        if not ts_str.startswith(partition_date):
+    for i, epoch in enumerate(timestamps):
+        ts_utc = epoch_to_utc(epoch)
+        # Only include records that belong to this (UTC) partition date
+        if ts_utc.date().isoformat() != partition_date:
             continue
 
-        ts_utc = datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
         record = {
             "location_name": location_name,
             "latitude": latitude,

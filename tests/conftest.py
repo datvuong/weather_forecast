@@ -1,6 +1,7 @@
 """Shared pytest fixtures: temp data directories, sample API responses, fake clients."""
 
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -27,20 +28,22 @@ def make_api_response(
     days: int = 1,
     variables: list[str] | None = None,
     temperature_base: float = 15.0,
+    daily_variables: list[str] | tuple[str, ...] = (),
+    tz: str = "Australia/Adelaide",
+    unsupported: list[str] | tuple[str, ...] = (),
 ) -> dict:
-    """Build an Open-Meteo-style hourly response with UTC timestamps.
+    """Build an Open-Meteo-style response in unixtime format (as Bronze requests it).
 
-    Temperature rises by 0.5 °C per hour from temperature_base, so the
-    expected min/max/avg for a day are easy to compute in tests.
+    Hourly rows cover `days` UTC days from `start` 00:00 UTC. Temperature rises
+    by 0.5 °C per hour from temperature_base, so the expected min/max/avg for a
+    day are easy to compute. Daily rows (if requested) are stamped with the
+    epoch of local midnight in `tz`, like the real API. Variables listed in
+    `unsupported` get unit "undefined" and null values.
     """
     variables = VARIABLES if variables is None else variables
     hours = 24 * days
-    times = [
-        (datetime.combine(start, datetime.min.time()) + timedelta(hours=h)).strftime(
-            "%Y-%m-%dT%H:%M"
-        )
-        for h in range(hours)
-    ]
+    utc_start = datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc)
+    times = [int((utc_start + timedelta(hours=h)).timestamp()) for h in range(hours)]
     generators = {
         "temperature_2m": lambda h: temperature_base + 0.5 * (h % 24),
         "relative_humidity_2m": lambda h: 60.0,
@@ -50,19 +53,54 @@ def make_api_response(
         "wind_direction_10m": lambda h: 180.0,
         "wind_gusts_10m": lambda h: 20.0,
         "uv_index": lambda h: None if h % 24 < 6 else 3.0,
+        "cloud_cover": lambda h: 40.0,
     }
     hourly = {"time": times}
+    hourly_units = {"time": "unixtime"}
     for var in variables:
-        hourly[var] = [generators[var](h) for h in range(hours)]
+        hourly[var] = [
+            None if var in unsupported else generators[var](h) for h in range(hours)
+        ]
+        hourly_units[var] = "undefined" if var in unsupported else "x"
 
-    return {
+    response = {
         "latitude": -34.9,
         "longitude": 138.6,
-        "utc_offset_seconds": 0,
-        "timezone": "GMT",
-        "timezone_abbreviation": "GMT",
+        "utc_offset_seconds": int(ZoneInfo(tz).utcoffset(utc_start).total_seconds()),
+        "timezone": tz,
+        "hourly_units": hourly_units,
         "hourly": hourly,
     }
+
+    if daily_variables:
+        local_midnights = [
+            datetime.combine(start + timedelta(days=d), datetime.min.time(), tzinfo=ZoneInfo(tz))
+            for d in range(days)
+        ]
+        daily_generators = {
+            "temperature_2m_max": lambda d, m: temperature_base + 11.5 + d,
+            "temperature_2m_min": lambda d, m: temperature_base + d,
+            "precipitation_sum": lambda d, m: 3.0,
+            "precipitation_probability_max": lambda d, m: 80.0,
+            "uv_index_max": lambda d, m: 7.0,
+            "sunrise": lambda d, m: int((m + timedelta(hours=6, minutes=30)).timestamp()),
+            "sunset": lambda d, m: int((m + timedelta(hours=19, minutes=30)).timestamp()),
+        }
+        time_valued = {"sunrise", "sunset"}
+        daily = {"time": [int(m.timestamp()) for m in local_midnights]}
+        daily_units = {"time": "unixtime"}
+        for var in daily_variables:
+            daily[var] = [
+                None if var in unsupported else daily_generators[var](d, m)
+                for d, m in enumerate(local_midnights)
+            ]
+            daily_units[var] = (
+                "undefined" if var in unsupported else "unixtime" if var in time_valued else "x"
+            )
+        response["daily"] = daily
+        response["daily_units"] = daily_units
+
+    return response
 
 
 class FakeOpenMeteoClient:

@@ -6,6 +6,7 @@ import os
 from datetime import date, datetime, timezone
 from functools import lru_cache
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import yaml
 
@@ -117,3 +118,17 @@ def get_warehouse_dir() -> Path:
 def utc_today() -> date:
     """Return today's date in UTC — the timezone of the daily partitions."""
     return datetime.now(timezone.utc).date()
+
+
+def epoch_to_utc(seconds: int | float) -> datetime:
+    """Convert an Open-Meteo unixtime value (UTC epoch seconds) to an aware UTC datetime."""
+    return datetime.fromtimestamp(seconds, tz=timezone.utc)
+
+
+def epoch_to_local_date(seconds: int | float, tz_name: str) -> date:
+    """Return the calendar date of a UTC epoch in an IANA timezone (DST-safe).
+
+    Open-Meteo daily rows in unixtime format are stamped with the epoch of
+    local midnight, so this yields the local day the aggregate covers.
+    """
+    return datetime.fromtimestamp(seconds, tz=ZoneInfo(tz_name)).date()
