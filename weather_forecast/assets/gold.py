@@ -45,7 +45,12 @@ from weather_forecast.assets.silver import silver_hourly_weather, silver_path
 from weather_forecast.models.weather import VariablesConfig
 from weather_forecast.partitions import daily_partitions
 from weather_forecast.resources.duckdb_resource import DuckDBResource, ensure_table
-from weather_forecast.utils.helpers import fill_location_ids, get_data_dir, load_locations_config
+from weather_forecast.utils.helpers import (
+    fill_location_ids,
+    get_data_dir,
+    load_locations_config,
+    write_parquet,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -189,9 +194,7 @@ def _write_gold(
         conn.execute(f"DELETE FROM {table} WHERE date = ?", [partition_date_str])
         conn.execute(f"INSERT INTO {table} BY NAME SELECT * FROM result_df")
 
-    output_path = gold_path(table.removeprefix("gold_"), partition_date_str)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    result_df.to_parquet(str(output_path), compression="snappy", index=False)
+    write_parquet(result_df, gold_path(table.removeprefix("gold_"), partition_date_str))
 
     context.add_output_metadata(
         {

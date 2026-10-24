@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
+from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import yaml
 
 from weather_forecast.models.weather import (
@@ -231,3 +235,30 @@ def fill_location_ids(df):
     else:
         df["location_id"] = df["location_id"].fillna(fallback)
     return df
+
+
+def atomic_write(path: str | Path, write: Callable[[str], None]) -> None:
+    """Write a file so readers see either the old or the new version, never a partial one.
+
+    `write` receives a temporary path in the same directory; the result is then
+    moved into place with os.replace (atomic on POSIX). Concurrent runs read
+    each other's files (views read every Silver file, Gold reads neighbouring
+    partitions), so in-place writes could be observed half-written. The temp
+    name is a dotfile ending in .tmp, so `*.parquet` globs never match it.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        write(str(tmp))
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def write_parquet(data, path: str | Path) -> None:
+    """Atomically write a pandas DataFrame or pyarrow Table as snappy Parquet."""
+    if isinstance(data, pa.Table):
+        atomic_write(path, lambda tmp: pq.write_table(data, tmp, compression="snappy"))
+    else:
+        atomic_write(path, lambda tmp: data.to_parquet(tmp, compression="snappy", index=False))

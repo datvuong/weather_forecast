@@ -19,7 +19,6 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 from dagster import (
     AssetCheckResult,
     AssetExecutionContext,
@@ -42,6 +41,7 @@ from weather_forecast.utils.helpers import (
     load_locations_config,
     load_variables_config,
     utc_today,
+    write_parquet,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,8 +65,7 @@ def write_bronze_record(
         "ingestion_timestamp": [ingestion_ts],
         "api_endpoint": [api_endpoint],
     }
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.table(record), str(output_path), compression="snappy")
+    write_parquet(pa.table(record), output_path)
     return output_path.stat().st_size
 
 

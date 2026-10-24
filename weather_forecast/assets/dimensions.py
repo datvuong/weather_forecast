@@ -43,6 +43,7 @@ from weather_forecast.utils.helpers import (
     get_data_dir,
     load_locations_config,
     load_weather_codes,
+    write_parquet,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,9 +75,7 @@ def dim_weather_code(context: AssetExecutionContext, duckdb_resource: DuckDBReso
     with duckdb_resource.get_connection() as conn:
         conn.execute("CREATE OR REPLACE TABLE dim_weather_code AS SELECT * FROM df")
 
-    output_path = dimension_path("dim_weather_code")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(str(output_path), compression="snappy", index=False)
+    write_parquet(df, dimension_path("dim_weather_code"))
 
     context.add_output_metadata(
         {
@@ -183,9 +182,7 @@ def dim_location(context: AssetExecutionContext, duckdb_resource: DuckDBResource
         conn.register("dim_location_rows", table)
         conn.execute("CREATE OR REPLACE TABLE dim_location AS SELECT * FROM dim_location_rows")
 
-    output_path = dimension_path("dim_location")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(table, str(output_path), compression="snappy")
+    write_parquet(table, dimension_path("dim_location"))
 
     df = table.to_pandas()
     context.add_output_metadata(

@@ -52,6 +52,7 @@ from weather_forecast.utils.helpers import (
     get_data_dir,
     load_locations_config,
     load_variables_config,
+    write_parquet,
 )
 
 logger = logging.getLogger(__name__)
@@ -282,8 +283,7 @@ def build_silver_section(
     duplicates_removed = before_dedup - len(df)
     df = df.sort_values(keys).reset_index(drop=True)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(str(output_path), compression="snappy", index=False)
+    write_parquet(df, output_path)
 
     if df.empty:
         context.log.warning(f"No valid {section} records for partition {partition_date_str}")

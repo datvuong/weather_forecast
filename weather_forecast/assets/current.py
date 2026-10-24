@@ -59,6 +59,7 @@ from weather_forecast.utils.helpers import (
     load_locations_config,
     load_variables_config,
     utc_today,
+    write_parquet,
 )
 
 logger = logging.getLogger(__name__)
@@ -227,9 +228,7 @@ def gold_current_conditions(
     with duckdb_resource.get_connection() as conn:
         conn.execute("CREATE OR REPLACE TABLE gold_current_conditions AS SELECT * FROM latest")
 
-    output_path = current_conditions_path()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    latest.to_parquet(str(output_path), compression="snappy", index=False)
+    write_parquet(latest, current_conditions_path())
 
     context.add_output_metadata(
         {
