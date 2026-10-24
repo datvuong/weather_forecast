@@ -6,6 +6,7 @@ Provides a managed DuckDB connection for Gold layer analytics queries.
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator
@@ -15,6 +16,11 @@ import pandas as pd
 from dagster import ConfigurableResource
 
 logger = logging.getLogger(__name__)
+
+# DuckDB allows a single writer process per database file. Gold assets (and
+# parallel backfill runs) may contend for it, so connection attempts are retried.
+LOCK_RETRY_ATTEMPTS = 20
+LOCK_RETRY_WAIT = 0.5  # seconds
 
 
 class DuckDBResource(ConfigurableResource):
@@ -33,7 +39,8 @@ class DuckDBResource(ConfigurableResource):
     def get_connection(self) -> Generator[duckdb.DuckDBPyConnection, None, None]:
         """Get a DuckDB connection as a context manager.
 
-        Creates parent directories if they don't exist.
+        Creates parent directories if they don't exist. Retries while another
+        process holds the database file lock.
 
         Yields:
             An open DuckDB connection.
@@ -41,7 +48,15 @@ class DuckDBResource(ConfigurableResource):
         db_path = Path(self.database_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        conn = duckdb.connect(str(db_path))
+        for attempt in range(LOCK_RETRY_ATTEMPTS):
+            try:
+                conn = duckdb.connect(str(db_path))
+                break
+            except duckdb.IOException as e:
+                if "lock" not in str(e).lower() or attempt == LOCK_RETRY_ATTEMPTS - 1:
+                    raise
+                logger.info("DuckDB file locked, retrying in %.1fs...", LOCK_RETRY_WAIT)
+                time.sleep(LOCK_RETRY_WAIT)
         try:
             yield conn
         finally:
