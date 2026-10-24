@@ -6,8 +6,9 @@ built from config, and writes clean Parquet files.
 
 The schema is wide and config-driven: every variable configured for a
 section in config/variables.yaml becomes a column, with no code changes.
-Time-valued variables (e.g. sunrise) are UTC timestamps; everything else is
-float64. Variables an endpoint doesn't provide are kept as null columns.
+Time-valued variables (e.g. sunrise) are UTC timestamps, variables with
+`dtype: integer` (codes, flags) nullable Int64, everything else float64.
+Variables an endpoint doesn't provide are kept as null columns.
 
 File layout (one file per partition date, containing all locations):
     data/silver/hourly/{partition_date}.parquet
@@ -35,9 +36,11 @@ from weather_forecast.assets.bronze import bronze_forecast
 from weather_forecast.models.weather import (
     SILVER_KEY_FIELDS,
     SILVER_METADATA_FIELDS,
+    TIME_UNITS,
     LocationConfig,
     Section,
     VariableDefinition,
+    VariableKind,
     build_record_model,
 )
 from weather_forecast.partitions import daily_partitions
@@ -51,9 +54,6 @@ from weather_forecast.utils.helpers import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Units marking a time-valued variable (Open-Meteo response or config)
-TIME_UNITS = frozenset({"unixtime", "iso8601"})
 
 # Columns identifying one record per section (deduplication keys)
 SECTION_KEYS: dict[str, list[str]] = {
@@ -76,19 +76,19 @@ def section_columns(section: Section, variables: list[str]) -> list[str]:
     return [*SILVER_KEY_FIELDS[section], *variables, *SILVER_METADATA_FIELDS]
 
 
-def time_variables(
+def variable_kinds(
     definitions: list[VariableDefinition], responses: list[dict[str, Any]], section: Section
-) -> set[str]:
-    """Return the time-valued variables of a section.
+) -> dict[str, VariableKind]:
+    """Return how each configured variable of a section is stored.
 
-    A variable is time-valued if its configured unit or any response's unit
-    is iso8601/unixtime (e.g. sunrise, sunset).
+    "time" if its configured unit or any response's unit is iso8601/unixtime
+    (e.g. sunrise), otherwise the configured dtype ("integer" or "float").
     """
-    names = {d.name for d in definitions if d.unit in TIME_UNITS}
+    reported_time = set()
     for raw in responses:
         units = raw.get(f"{section}_units") or {}
-        names |= {n for n, unit in units.items() if unit in TIME_UNITS and n != "time"}
-    return names & {d.name for d in definitions}
+        reported_time |= {n for n, unit in units.items() if unit in TIME_UNITS and n != "time"}
+    return {d.name: "time" if d.name in reported_time else d.kind for d in definitions}
 
 
 def _section_keys(
@@ -133,8 +133,7 @@ def _section_keys(
 def parse_section(
     raw_json: dict[str, Any],
     section: Section,
-    variables: list[str],
-    time_vars: set[str],
+    kinds: dict[str, VariableKind],
     location: LocationConfig,
     partition_date: date,
     ingestion_ts: datetime,
@@ -149,8 +148,7 @@ def parse_section(
     Args:
         raw_json: Parsed API response JSON.
         section: "hourly", "daily" or "current".
-        variables: Configured variable names for the section (become columns).
-        time_vars: The subset of variables holding timestamps.
+        kinds: Configured variables (become columns) mapped to their kind.
         location: The location the response belongs to.
         partition_date: The partition date (UTC day).
         ingestion_ts: When the data was ingested (from Bronze).
@@ -186,10 +184,10 @@ def parse_section(
             "partition_date": partition_date.isoformat(),
             "ingestion_timestamp": ingestion_ts,
         }
-        for var in variables:
+        for var in kinds:
             values = data.get(var, [])
             value = values[i] if i < len(values) else None
-            if var in time_vars and isinstance(value, (int, float)):
+            if kinds[var] == "time" and isinstance(value, (int, float)):
                 value = epoch_to_utc(value)
             record[var] = value
 
@@ -199,10 +197,14 @@ def parse_section(
 
 
 def to_silver_frame(
-    section: Section, records: list[dict[str, Any]], variables: list[str], time_vars: set[str]
+    section: Section, records: list[dict[str, Any]], kinds: dict[str, VariableKind]
 ) -> pd.DataFrame:
-    """Build a typed Silver DataFrame (also for zero records)."""
-    df = pd.DataFrame(records, columns=section_columns(section, variables))
+    """Build a typed Silver DataFrame (also for zero records).
+
+    Variables: "time" -> UTC timestamp, "integer" -> nullable Int64,
+    "float" -> float64.
+    """
+    df = pd.DataFrame(records, columns=section_columns(section, list(kinds)))
     for col in ("timestamp_utc", "observed_at_utc", "ingestion_timestamp"):
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], utc=True)
@@ -213,9 +215,11 @@ def to_silver_frame(
         df[col] = df[col].astype("float64")
     if "interval_seconds" in df.columns:
         df["interval_seconds"] = df["interval_seconds"].astype("Int64")
-    for var in variables:
-        if var in time_vars:
+    for var, kind in kinds.items():
+        if kind == "time":
             df[var] = pd.to_datetime(df[var], utc=True)
+        elif kind == "integer":
+            df[var] = df[var].astype("Int64")
         else:
             df[var] = df[var].astype("float64")
     return df
@@ -240,8 +244,8 @@ def build_silver_section(
     config = load_variables_config()
     definitions = config.section(section)
     variables = [d.name for d in definitions]
-    time_vars = time_variables(definitions, [raw for _, raw, _ in bronze_rows], section)
-    record_model = build_record_model(section, {v: v in time_vars for v in variables})
+    kinds = variable_kinds(definitions, [raw for _, raw, _ in bronze_rows], section)
+    record_model = build_record_model(section, kinds)
 
     records: list[dict] = []
     invalid_count = 0
@@ -250,7 +254,7 @@ def build_silver_section(
 
     for location, raw_json, ingestion_ts in bronze_rows:
         parsed = parse_section(
-            raw_json, section, variables, time_vars, location, partition_date, ingestion_ts
+            raw_json, section, kinds, location, partition_date, ingestion_ts
         )
         total_raw += len(parsed)
         missing = unsupported_variables(raw_json).get(section)
@@ -265,7 +269,7 @@ def build_silver_section(
                 if invalid_count <= 5:  # Only log first 5
                     context.log.warning(f"Invalid {section} record for {location.name}: {e}")
 
-    df = to_silver_frame(section, records, variables, time_vars)
+    df = to_silver_frame(section, records, kinds)
 
     # Deduplicate: keep last (most recent ingestion) for each key
     keys = SECTION_KEYS[section]

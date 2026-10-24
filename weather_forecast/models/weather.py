@@ -8,8 +8,10 @@ Defines strict schemas for:
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from typing import Literal, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, create_model, field_validator, model_validator
 
@@ -36,6 +38,7 @@ RESERVED_COLUMN_NAMES = frozenset(
     {
         "time",
         "interval",
+        "location_id",
         "location_name",
         "latitude",
         "longitude",
@@ -50,6 +53,18 @@ RESERVED_COLUMN_NAMES = frozenset(
     }
 )
 
+# Units marking a time-valued variable (Open-Meteo response or config)
+TIME_UNITS = frozenset({"unixtime", "iso8601"})
+
+# Storage kind of a Silver variable column
+VariableKind = Literal["time", "integer", "float"]
+
+
+def slugify(name: str) -> str:
+    """Return a lowercase identifier for a name, e.g. "São Paulo" -> "s_o_paulo"."""
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
 # ---------------------------------------------------------------------------
 # Configuration models (parsed from YAML)
 # ---------------------------------------------------------------------------
@@ -61,10 +76,36 @@ class LocationConfig(BaseModel):
     Parsed from config/locations.yaml.
     """
 
+    id: str = Field(
+        ...,
+        pattern=r"^[a-z0-9][a-z0-9_]*$",
+        description="Stable location key (defaults to a slug of name)",
+    )
     name: str = Field(..., description="Human-readable city name")
     latitude: float = Field(..., ge=-90, le=90, description="WGS84 latitude")
     longitude: float = Field(..., ge=-180, le=180, description="WGS84 longitude")
     timezone: str = Field(..., description="IANA timezone string")
+    country: Optional[str] = Field(default=None, description="Country, for grouping")
+    region: Optional[str] = Field(default=None, description="State/region, for grouping")
+    tags: list[str] = Field(default_factory=list, description="Free-form labels")
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_id(cls, data):
+        """Derive id from name when it isn't given."""
+        if isinstance(data, dict) and not data.get("id") and data.get("name"):
+            data = {**data, "id": slugify(str(data["name"]))}
+        return data
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, v: str) -> str:
+        """Ensure the timezone is a known IANA name."""
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValueError(f"unknown IANA timezone: {v!r}")
+        return v
 
 
 class VariableDefinition(BaseModel):
@@ -79,6 +120,21 @@ class VariableDefinition(BaseModel):
     valid_range: Optional[tuple[float, float]] = Field(
         default=None, description="Inclusive [min, max] used by Silver quality checks"
     )
+    dtype: Literal["float", "integer"] = Field(
+        default="float", description="Storage type; integer for codes and flags"
+    )
+
+    @model_validator(mode="after")
+    def validate_dtype(self) -> "VariableDefinition":
+        """Time-valued variables are stored as timestamps, not integers."""
+        if self.dtype == "integer" and self.unit in TIME_UNITS:
+            raise ValueError(f"{self.name}: dtype integer can't be used with unit {self.unit!r}")
+        return self
+
+    @property
+    def kind(self) -> VariableKind:
+        """How Silver stores the variable (time-valued per configured unit)."""
+        return "time" if self.unit in TIME_UNITS else self.dtype
 
     @field_validator("name")
     @classmethod
@@ -193,6 +249,16 @@ class LocationsConfig(BaseModel):
 
     locations: list[LocationConfig]
 
+    @model_validator(mode="after")
+    def validate_unique(self) -> "LocationsConfig":
+        """Location ids and names must be unique."""
+        for field in ("id", "name"):
+            values = [getattr(loc, field) for loc in self.locations]
+            duplicates = sorted({v for v in values if values.count(v) > 1})
+            if duplicates:
+                raise ValueError(f"duplicate location {field}s: {duplicates}")
+        return self
+
 
 # ---------------------------------------------------------------------------
 # Domain models (cleaned data)
@@ -251,21 +317,24 @@ class SilverRecord(BaseModel):
         return v
 
 
-def build_record_model(section: Section, variables: dict[str, bool]) -> type[SilverRecord]:
+_KIND_TYPES = {"time": datetime, "integer": int, "float": float}
+
+
+def build_record_model(section: Section, variables: dict[str, VariableKind]) -> type[SilverRecord]:
     """Build the Pydantic model validating one Silver record of a section.
 
     Args:
         section: "hourly", "daily" or "current" (selects the key columns).
-        variables: Configured variable names mapped to True for time-valued
-            variables (e.g. sunrise) and False for numeric ones.
+        variables: Configured variable names mapped to their kind: "time"
+            (e.g. sunrise), "integer" (codes/flags) or "float".
 
     Returns:
         A SilverRecord subclass with required key fields and Optional
-        variable fields (datetime for time-valued, float otherwise).
+        variable fields typed by kind.
     """
     fields: dict = {name: (type_, ...) for name, type_ in SILVER_KEY_FIELDS[section].items()}
-    for name, is_time in variables.items():
-        fields[name] = (Optional[datetime] if is_time else Optional[float], None)
+    for name, kind in variables.items():
+        fields[name] = (Optional[_KIND_TYPES[kind]], None)
     return create_model(f"{section.title()}WeatherRecord", __base__=SilverRecord, **fields)
 
 

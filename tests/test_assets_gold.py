@@ -139,7 +139,7 @@ class TestGoldRequirements:
     def test_extra_variables_are_fine(self, variables_config):
         config = load_variables_config()
         hourly = [v.model_dump() for v in config.hourly_variables]
-        hourly.append({"name": "cloud_cover", "description": "c", "unit": "%"})
+        hourly.append({"name": "visibility", "description": "v", "unit": "m"})
 
         validate_gold_requirements(variables_config(hourly_variables=hourly))
 

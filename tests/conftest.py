@@ -27,6 +27,10 @@ VARIABLES = [
     "wind_direction_10m",
     "wind_gusts_10m",
     "uv_index",
+    "weather_code",
+    "is_day",
+    "apparent_temperature",
+    "cloud_cover",
 ]
 
 
@@ -63,6 +67,9 @@ def make_api_response(
         "wind_direction_10m": lambda h: 180.0,
         "wind_gusts_10m": lambda h: 20.0,
         "uv_index": lambda h: None if h % 24 < 6 else 3.0,
+        "weather_code": lambda h: 61 if h % 24 < 3 else 2,
+        "is_day": lambda h: 1 if 6 <= h % 24 < 18 else 0,
+        "apparent_temperature": lambda h: temperature_base - 1.0 + 0.5 * (h % 24),
         "cloud_cover": lambda h: 40.0,
     }
     hourly = {"time": times}
@@ -97,6 +104,9 @@ def make_api_response(
             "precipitation_probability_max": lambda d, m: 80.0,
             "uv_index_max": lambda d, m: 7.0,
             "wind_speed_10m_max": lambda d, m: 25.0,
+            "weather_code": lambda d, m: 61,
+            "daylight_duration": lambda d, m: 46800.0,
+            "sunshine_duration": lambda d, m: 36000.0,
             "sunrise": lambda d, m: int((m + timedelta(hours=6, minutes=30)).timestamp()),
             "sunset": lambda d, m: int((m + timedelta(hours=19, minutes=30)).timestamp()),
         }

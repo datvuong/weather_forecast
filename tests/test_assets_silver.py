@@ -29,7 +29,8 @@ DAILY = ["temperature_2m_max", "precipitation_sum", "sunrise"]
 
 def _parse(raw, section="hourly", variables=None, time_vars=frozenset(), day=date(2026, 10, 21)):
     variables = variables if variables is not None else ["temperature_2m", "uv_index"]
-    return parse_section(raw, section, variables, set(time_vars), ADELAIDE, day, INGESTED)
+    kinds = {v: "time" if v in time_vars else "float" for v in variables}
+    return parse_section(raw, section, kinds, ADELAIDE, day, INGESTED)
 
 
 def _materialize(partition_key, assets, checks=()):
@@ -169,7 +170,11 @@ class TestSilverHourly:
         assert list(df.columns) == section_columns("hourly", load_variables_config().hourly_names)
         assert len(df) == 24 * len(locations)
         assert str(df["timestamp_utc"].dt.tz) == "UTC"
-        assert all(df[c].dtype == "float64" for c in load_variables_config().hourly_names)
+        kinds = {d.name: d.kind for d in load_variables_config().hourly_variables}
+        assert all(df[c].dtype == "float64" for c, k in kinds.items() if k == "float")
+        assert all(df[c].dtype == "Int64" for c, k in kinds.items() if k == "integer")
+        assert set(df["weather_code"]) == {61, 2}
+        assert set(df["is_day"]) == {0, 1}
         # Unsupported on the endpoint: nulls are preserved, reported in metadata
         assert df["precipitation_probability"].isna().all()
         assert df["uv_index"].isna().sum() == 6 * len(locations)
@@ -202,6 +207,29 @@ class TestSilverHourly:
         assert (df["cloud_cover"] == 40.0).all()
         [evaluation] = result.get_asset_check_evaluations()
         assert evaluation.passed
+
+    def test_integer_variables_are_nullable_int64(
+        self, data_dir, locations, past_date, variables_config
+    ):
+        variables_config(
+            hourly_variables=[
+                {"name": "temperature_2m", "description": "t", "unit": "°C"},
+                {"name": "weather_code", "description": "w", "unit": "wmo code",
+                 "dtype": "integer"},
+            ]
+        )
+        pk = past_date.isoformat()
+        raw = make_api_response(past_date, variables=["temperature_2m", "weather_code"])
+        raw["hourly"]["weather_code"][0] = None
+        for loc in locations:
+            write_bronze_file(data_dir, loc.name, pk, [(raw, INGESTED)])
+
+        _materialize(pk, [silver_hourly_weather])
+
+        df = pd.read_parquet(silver_path("hourly", pk))
+        assert df["weather_code"].dtype == "Int64"
+        assert df["weather_code"].isna().sum() == len(locations)
+        assert set(df["weather_code"].dropna()) == {61, 2}
 
     def test_configured_variable_absent_from_response_is_null(
         self, data_dir, locations, past_date, variables_config

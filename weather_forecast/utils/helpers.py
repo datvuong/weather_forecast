@@ -18,6 +18,31 @@ from weather_forecast.models.weather import (
 
 logger = logging.getLogger(__name__)
 
+
+class _StrictLoader(yaml.SafeLoader):
+    """YAML loader that rejects duplicate keys (PyYAML keeps the last one silently)."""
+
+
+def _construct_mapping_no_duplicates(loader, node, deep=False):
+    keys = [loader.construct_object(key_node, deep=deep) for key_node, _ in node.value]
+    duplicates = sorted({str(k) for k in keys if keys.count(k) > 1})
+    if duplicates:
+        raise yaml.constructor.ConstructorError(
+            None, None, f"duplicate keys {duplicates}", node.start_mark
+        )
+    return loader.construct_mapping(node, deep)
+
+
+_StrictLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping_no_duplicates
+)
+
+
+def load_yaml(path: str | Path) -> dict:
+    """Load a YAML config file, rejecting duplicate keys."""
+    with open(path, encoding="utf-8") as f:
+        return yaml.load(f, Loader=_StrictLoader)
+
 # Open-Meteo free tier
 API_DAILY_CALL_LIMIT = 10_000
 API_BUDGET_WARNING_RATIO = 0.8
@@ -61,8 +86,7 @@ def load_locations_config(config_path: str | Path | None = None) -> list[Locatio
     else:
         config_path = Path(config_path)
 
-    with open(config_path) as f:
-        raw = yaml.safe_load(f)
+    raw = load_yaml(config_path)
 
     config = LocationsConfig(**raw)
     return config.locations
@@ -84,8 +108,7 @@ def load_variables_config(config_path: str | Path | None = None) -> VariablesCon
     else:
         config_path = Path(config_path)
 
-    with open(config_path) as f:
-        raw = yaml.safe_load(f)
+    raw = load_yaml(config_path)
 
     return VariablesConfig.model_validate(raw)
 

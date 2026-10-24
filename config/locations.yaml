@@ -1,21 +1,37 @@
 # Weather Forecast Pipeline - Location Configuration
 # ===================================================
 # Add or remove locations as needed. Each entry requires:
-#   name:      Human-readable city name (used as identifier in data files)
+#   name:      Human-readable city name (used in data file paths and tables)
 #   latitude:  WGS84 latitude in decimal degrees
 #   longitude: WGS84 longitude in decimal degrees
 #   timezone:  IANA timezone string (used for local timestamp conversion)
+# Optional:
+#   id:        Stable key used to join tables (lowercase letters, digits, _).
+#              Defaults to a slug of name. Keep it unchanged once data exists.
+#   country:   Country, for grouping in analytics
+#   region:    State/region, for grouping in analytics
+#   tags:      List of free-form labels, e.g. [capital, coastal]
+#
+# Removing a location keeps its history: it stays in dim_location as inactive.
 #
 # Find coordinates: https://www.latlong.net/
 # Find timezones:   https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
 
 locations:
-  - name: Melbourne
+  - id: melbourne
+    name: Melbourne
     latitude: -37.8136
     longitude: 144.9631
     timezone: Australia/Melbourne
+    country: Australia
+    region: Victoria
+    tags: [capital]
 
-  - name: Adelaide
+  - id: adelaide
+    name: Adelaide
     latitude: -34.9285
     longitude: 138.6007
     timezone: Australia/Adelaide
+    country: Australia
+    region: South Australia
+    tags: [capital]

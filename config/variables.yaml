@@ -13,6 +13,8 @@
 #   description: Human-readable description
 #   unit:        Unit of measurement (documentation; "iso8601"/"unixtime" marks a time value)
 #   valid_range: Optional [min, max] enforced by the Silver quality checks
+#   dtype:       Optional "float" (default) or "integer" (codes and flags, e.g.
+#                weather_code, is_day; stored as nullable integers)
 #
 # Variables an endpoint doesn't support (e.g. precipitation_probability in the archive)
 # are kept as null columns rather than failing the run.
@@ -58,6 +60,28 @@ hourly_variables:
     unit: "index"
     valid_range: [0, 20]
 
+  - name: weather_code
+    description: "WMO weather interpretation code (see config/weather_codes.yaml)"
+    unit: "wmo code"
+    dtype: integer
+    valid_range: [0, 99]
+
+  - name: is_day
+    description: "1 during daylight, 0 at night"
+    unit: "flag"
+    dtype: integer
+    valid_range: [0, 1]
+
+  - name: apparent_temperature
+    description: "Feels-like temperature (wind chill, humidity, radiation)"
+    unit: "°C"
+    valid_range: [-80, 80]
+
+  - name: cloud_cover
+    description: "Total cloud cover"
+    unit: "%"
+    valid_range: [0, 100]
+
 daily_variables:
   - name: temperature_2m_max
     description: "Maximum daily air temperature at 2 meters"
@@ -97,6 +121,22 @@ daily_variables:
     description: "Sunset time"
     unit: "iso8601"
 
+  - name: weather_code
+    description: "Most severe WMO weather code of the day"
+    unit: "wmo code"
+    dtype: integer
+    valid_range: [0, 99]
+
+  - name: daylight_duration
+    description: "Time between sunrise and sunset"
+    unit: "s"
+    valid_range: [0, 86400]
+
+  - name: sunshine_duration
+    description: "Time with direct sunshine above 120 W/m² during the day"
+    unit: "s"
+    valid_range: [0, 86400]
+
 current_variables:
   - name: temperature_2m
     description: "Current air temperature at 2 meters"
@@ -121,6 +161,7 @@ current_variables:
   - name: weather_code
     description: "WMO weather interpretation code"
     unit: "wmo code"
+    dtype: integer
     valid_range: [0, 99]
 
   - name: wind_speed_10m
@@ -136,6 +177,7 @@ current_variables:
   - name: is_day
     description: "1 during daylight, 0 at night"
     unit: "flag"
+    dtype: integer
     valid_range: [0, 1]
 
 # API query settings

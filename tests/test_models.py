@@ -3,12 +3,14 @@
 from datetime import datetime, timezone
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from weather_forecast.models.weather import (
     APISettings,
     BronzeRecord,
     LocationConfig,
+    LocationsConfig,
     VariableDefinition,
     VariablesConfig,
     build_record_model,
@@ -38,6 +40,49 @@ class TestLocationConfig:
     def test_valid(self):
         loc = LocationConfig(name="Sydney", latitude=-33.87, longitude=151.21, timezone="UTC")
         assert loc.name == "Sydney"
+        assert (loc.country, loc.region, loc.tags) == (None, None, [])
+
+    @pytest.mark.parametrize(
+        "name,expected",
+        [("Sydney", "sydney"), ("New York", "new_york"), ("São Paulo", "s_o_paulo")],
+    )
+    def test_id_defaults_to_slug_of_name(self, name, expected):
+        loc = LocationConfig(name=name, latitude=0, longitude=0, timezone="UTC")
+        assert loc.id == expected
+
+    def test_explicit_id_and_attributes(self):
+        loc = LocationConfig(
+            id="syd",
+            name="Sydney",
+            latitude=-33.87,
+            longitude=151.21,
+            timezone="Australia/Sydney",
+            country="Australia",
+            region="New South Wales",
+            tags=["capital", "coastal"],
+        )
+        assert (loc.id, loc.country, loc.region, loc.tags) == (
+            "syd",
+            "Australia",
+            "New South Wales",
+            ["capital", "coastal"],
+        )
+
+    @pytest.mark.parametrize("bad_id", ["Sydney", "syd-1", "_syd", "syd city"])
+    def test_invalid_id_rejected(self, bad_id):
+        with pytest.raises(ValidationError):
+            LocationConfig(id=bad_id, name="Sydney", latitude=0, longitude=0, timezone="UTC")
+
+    def test_unknown_timezone_rejected(self):
+        with pytest.raises(ValidationError, match="unknown IANA timezone"):
+            LocationConfig(name="X", latitude=0, longitude=0, timezone="Australia/Atlantis")
+
+    @pytest.mark.parametrize("field", ["id", "name"])
+    def test_duplicates_rejected(self, field):
+        a = {"id": "a", "name": "A", "latitude": 0, "longitude": 0, "timezone": "UTC"}
+        b = {**a, "id": "b", "name": "B", field: a[field]}
+        with pytest.raises(ValidationError, match=f"duplicate location {field}s"):
+            LocationsConfig(locations=[a, b])
 
     @pytest.mark.parametrize("lat,lon", [(-91, 0), (91, 0), (0, -181), (0, 181)])
     def test_out_of_range_coordinates(self, lat, lon):
@@ -57,11 +102,26 @@ class TestVariableDefinition:
     def test_valid_range_optional(self):
         assert VariableDefinition(**_var("sunrise")).valid_range is None
 
+    def test_dtype_and_kind(self):
+        assert VariableDefinition(**_var("temperature_2m")).kind == "float"
+        assert VariableDefinition(**_var("weather_code", dtype="integer")).kind == "integer"
+        assert VariableDefinition(name="sunrise", description="s", unit="iso8601").kind == "time"
+
+    def test_integer_dtype_with_time_unit_rejected(self):
+        with pytest.raises(ValidationError, match="dtype integer"):
+            VariableDefinition(name="sunrise", description="s", unit="unixtime", dtype="integer")
+
+    def test_unknown_dtype_rejected(self):
+        with pytest.raises(ValidationError):
+            VariableDefinition(**_var("x", dtype="string"))
+
     def test_inverted_range_rejected(self):
         with pytest.raises(ValidationError, match="min must be <= max"):
             VariableDefinition(**_var("x", valid_range=[10, 0]))
 
-    @pytest.mark.parametrize("name", ["time", "location_name", "timestamp_utc", "date_local"])
+    @pytest.mark.parametrize(
+        "name", ["time", "location_id", "location_name", "timestamp_utc", "date_local"]
+    )
     def test_reserved_column_names_rejected(self, name):
         with pytest.raises(ValidationError, match="reserved"):
             VariableDefinition(**_var(name))
@@ -143,7 +203,7 @@ class TestVariablesConfig:
 
 
 HourlyRecord = build_record_model(
-    "hourly", {"temperature_2m": False, "relative_humidity_2m": False, "uv_index": False}
+    "hourly", {"temperature_2m": "float", "relative_humidity_2m": "float", "uv_index": "float"}
 )
 
 
@@ -174,12 +234,21 @@ class TestBuildRecordModel:
             HourlyRecord(**record)
 
     def test_fields_follow_config(self):
-        model = build_record_model("hourly", {"cloud_cover": False})
+        model = build_record_model("hourly", {"cloud_cover": "float"})
         assert "cloud_cover" in model.model_fields
         assert "temperature_2m" not in model.model_fields
 
+    def test_integer_variable(self):
+        model = build_record_model("hourly", {"weather_code": "integer"})
+        base = _record()
+        assert model(**base, weather_code=61).weather_code == 61
+        assert model(**base, weather_code=61.0).weather_code == 61
+        assert model(**base).weather_code is None
+        with pytest.raises(ValidationError):
+            model(**base, weather_code=61.5)
+
     def test_time_valued_variable_parses_epoch(self):
-        model = build_record_model("daily", {"sunrise": True, "precipitation_sum": False})
+        model = build_record_model("daily", {"sunrise": "time", "precipitation_sum": "float"})
         rec = model(
             location_name="Adelaide",
             latitude=-34.9,
@@ -231,8 +300,31 @@ class TestConfigLoaders:
         config = load_variables_config()
         assert "temperature_2m" in config.variable_names
         assert config.daily_names and config.current_names
+        kinds = {s: {d.name: d.kind for d in config.section(s)} for s in ("hourly", "daily")}
+        assert kinds["hourly"]["weather_code"] == kinds["hourly"]["is_day"] == "integer"
+        assert {"apparent_temperature", "cloud_cover"} <= set(kinds["hourly"])
+        assert kinds["daily"]["weather_code"] == "integer"
+        assert {"daylight_duration", "sunshine_duration"} <= set(kinds["daily"])
         assert config.settings.forecast_days >= 1
         assert config.section("hourly")[0].valid_range is not None
+
+    def test_project_locations_have_ids_and_attributes(self):
+        locations = {loc.id: loc for loc in load_locations_config()}
+        assert {"melbourne", "adelaide"} <= set(locations)
+        assert locations["adelaide"].region == "South Australia"
+
+    def test_duplicate_yaml_keys_rejected(self, tmp_path):
+        path = tmp_path / "variables.yaml"
+        path.write_text(
+            "hourly_variables:\n"
+            "  - name: temperature_2m\n"
+            "    description: t\n"
+            "    unit: C\n"
+            "    valid_range: [0, 10]\n"
+            "    valid_range: [0, 50]\n"
+        )
+        with pytest.raises(yaml.constructor.ConstructorError, match="duplicate keys"):
+            load_variables_config(path)
 
     def test_custom_locations_file(self, tmp_path):
         path = tmp_path / "locations.yaml"
