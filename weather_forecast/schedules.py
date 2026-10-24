@@ -7,6 +7,8 @@ Defines two jobs, each with a schedule targeting today's (UTC) partition:
 - current_weather_job (every settings.current_interval_minutes): current
   conditions snapshots. Kept out of the pipeline job because they can't be
   backfilled.
+- dimensions_job (on demand): dimensions and warehouse views only; they also
+  run at the end of every weather_pipeline_job run.
 """
 
 from datetime import timedelta, timezone
@@ -36,8 +38,18 @@ CURRENT_WEATHER_ASSETS = AssetSelection.assets(
 # Define a job covering the full asset pipeline (partitioning is inferred from the assets)
 weather_pipeline_job = define_asset_job(
     name="weather_pipeline_job",
-    selection=AssetSelection.groups("bronze", "silver", "gold") - CURRENT_WEATHER_ASSETS,
-    description="Full weather pipeline: Bronze → Silver → Gold for a given partition date.",
+    selection=AssetSelection.groups("bronze", "silver", "gold", "dimensions")
+    - CURRENT_WEATHER_ASSETS,
+    description=(
+        "Full weather pipeline: Bronze → Silver → Gold for a given partition date, "
+        "then the dimensions and warehouse views."
+    ),
+)
+
+dimensions_job = define_asset_job(
+    name="dimensions_job",
+    selection=AssetSelection.groups("dimensions"),
+    description="Rebuild dimensions and warehouse views, e.g. after editing config/*.yaml.",
 )
 
 current_weather_job = define_asset_job(

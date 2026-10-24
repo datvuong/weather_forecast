@@ -74,6 +74,7 @@ def test_definitions_load():
         "gold_daily_precipitation",
         "dim_weather_code",
         "dim_location",
+        "warehouse_views",
     }
     assert defs.resolve_job_def("weather_pipeline_job").partitions_def == daily_partitions
 

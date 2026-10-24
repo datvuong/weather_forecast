@@ -35,11 +35,13 @@ from weather_forecast.assets.silver import (
     silver_hourly_weather,
     silver_quality_check,
 )
+from weather_forecast.assets.warehouse import warehouse_views, warehouse_views_check
 from weather_forecast.resources.api_client import OpenMeteoClient
 from weather_forecast.resources.duckdb_resource import DuckDBResource
 from weather_forecast.schedules import (
     current_weather_job,
     current_weather_schedule,
+    dimensions_job,
     hourly_weather_schedule,
     weather_pipeline_job,
 )
@@ -65,6 +67,7 @@ defs = dg.Definitions(
         gold_current_conditions,
         dim_weather_code,
         dim_location,
+        warehouse_views,
     ],
     asset_checks=[
         bronze_file_exists_check,
@@ -77,8 +80,9 @@ defs = dg.Definitions(
         daily_weather_code_check,
         current_weather_code_check,
         dim_location_check,
+        warehouse_views_check,
     ],
-    jobs=[weather_pipeline_job, current_weather_job],
+    jobs=[weather_pipeline_job, current_weather_job, dimensions_job],
     schedules=[hourly_weather_schedule, current_weather_schedule],
     resources={
         "open_meteo_client": OpenMeteoClient(),
