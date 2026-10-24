@@ -116,7 +116,10 @@ def latest_bronze_metadata(location_name: str) -> dict:
     """Grid coordinates and elevation from the location's most recent Bronze response.
 
     Open-Meteo snaps requests to a model grid cell and reports its coordinates
-    and elevation in every response, so no extra API call is needed. Returns
+    and elevation in every response, so no extra API call is needed. The cell
+    can differ between endpoints (archive vs forecast); the latest-DATED file
+    is used, not the most recently fetched one, so the result doesn't depend on
+    backfill order. Per-row cells stay in Silver's latitude/longitude. Returns
     an empty dict if no Bronze file exists yet.
     """
     files = sorted((get_data_dir() / "bronze" / location_name).glob("*.parquet"))

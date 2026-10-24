@@ -35,6 +35,15 @@ VARIABLES = [
 ]
 
 
+# Model grid cell (lat, lon, elevation) Open-Meteo snaps each configured location to.
+# They differ from the configured coordinates, as in reality (Adelaide's values are
+# the real ones the API returns), so tests can tell API grid data from config.
+GRID_CELLS = {
+    "Australia/Adelaide": (-34.90334, 138.5406, 46.0),
+    "Australia/Melbourne": (-37.80142, 144.9541, 19.0),
+}
+
+
 def make_api_response(
     start: date,
     days: int = 1,
@@ -44,6 +53,7 @@ def make_api_response(
     tz: str = "Australia/Adelaide",
     unsupported: list[str] | tuple[str, ...] = (),
     utc_offset_seconds: int | None = None,
+    grid: tuple[float, float, float] | None = None,
 ) -> dict:
     """Build an Open-Meteo-style response in unixtime format (as Bronze requests it).
 
@@ -54,6 +64,8 @@ def make_api_response(
     for "the offset at request time"), and daily rows are stamped with local
     midnight under that fixed offset, even for dates across a DST change.
     Variables listed in `unsupported` get unit "undefined" and null values.
+    The response reports `grid` (lat, lon, elevation), by default the model
+    cell of `tz`'s city from GRID_CELLS.
     """
     variables = VARIABLES if variables is None else variables
     hours = 24 * days
@@ -84,9 +96,11 @@ def make_api_response(
     if utc_offset_seconds is None:
         utc_offset_seconds = int(ZoneInfo(tz).utcoffset(utc_start).total_seconds())
     response_tz = timezone(timedelta(seconds=utc_offset_seconds))
+    grid_lat, grid_lon, elevation = grid or GRID_CELLS.get(tz, GRID_CELLS["Australia/Adelaide"])
     response = {
-        "latitude": -34.9,
-        "longitude": 138.6,
+        "latitude": grid_lat,
+        "longitude": grid_lon,
+        "elevation": elevation,
         "utc_offset_seconds": utc_offset_seconds,
         "timezone": tz,
         "hourly_units": hourly_units,
@@ -170,14 +184,20 @@ def make_current_response(
 class FakeOpenMeteoClient:
     """Stand-in for OpenMeteoClient that records requests and returns canned data."""
 
-    def __init__(self, archive_response=None, forecast_response=None, archive_error=None):
+    def __init__(
+        self, archive_response=None, forecast_response=None, archive_error=None, respond=None
+    ):
         self.archive_response = archive_response
         self.forecast_response = forecast_response
         self.archive_error = archive_error
+        # Optional callable(endpoint, request) -> response, for per-request answers
+        self.respond = respond
         self.calls: list[tuple[str, OpenMeteoRequest]] = []
 
     def fetch(self, endpoint: str, request: OpenMeteoRequest) -> dict:
         self.calls.append((endpoint, request))
+        if self.respond is not None:
+            return self.respond(endpoint, request)
         if endpoint == "archive":
             if self.archive_error is not None:
                 raise self.archive_error
