@@ -316,14 +316,23 @@ def gold_daily_precipitation(
 
 # Expected hours in a local day (DST change days have 23 or 25)
 COMPLETE_DAY_HOURS = (23, 25)
-SILVER_DAILY_TOLERANCE_C = 0.5
+# Gold vs the API's own daily extremes (Silver daily). The API's daily min/max
+# don't come from the 24 hourly values alone: they include the day boundary
+# (e.g. a daily min equal to 00:00 of the next day) and sub-hourly model data,
+# so Gold (hourly) lies slightly INSIDE the API's range. Measured on the 31-day
+# backfill: worst gap 0.6 °C, never more extreme than the API (#32).
+SILVER_DAILY_TOLERANCE_C = 1.0
+# Rounding slack when checking Gold isn't more extreme than the API
+ROUNDING_SLACK_C = 0.05
 
 
 def _silver_daily_differences(df: pd.DataFrame, partition_date: str) -> list[str]:
     """Compare Gold min/max with the API's daily aggregates in Silver daily.
 
-    Only a warning: the API computes days with the response's fixed UTC offset,
-    so across a DST change its window is shifted by an hour.
+    Warns when Gold lies outside the API's daily range (impossible for the
+    same underlying data) or more than SILVER_DAILY_TOLERANCE_C inside it.
+    Only a warning: the API also builds days on the response's fixed UTC
+    offset, so across a DST change its window is shifted by an hour.
     """
     path = silver_path("daily", partition_date)
     if not path.exists():
@@ -333,17 +342,24 @@ def _silver_daily_differences(df: pd.DataFrame, partition_date: str) -> list[str
     for _, row in df.iterrows():
         if row["location_id"] not in daily.index:
             continue
-        for gold_col, api_col in (("temp_max_c", "temperature_2m_max"),
-                                  ("temp_min_c", "temperature_2m_min")):
+        for gold_col, api_col, sign in (
+            ("temp_max_c", "temperature_2m_max", 1),
+            ("temp_min_c", "temperature_2m_min", -1),
+        ):
             if api_col not in daily.columns:
                 continue
             api_value = daily.loc[row["location_id"], api_col]
-            if pd.notna(api_value) and pd.notna(row[gold_col]):
-                if abs(row[gold_col] - api_value) > SILVER_DAILY_TOLERANCE_C:
-                    differences.append(
-                        f"{row['location_id']}: {gold_col} {row[gold_col]} vs API "
-                        f"{api_col} {api_value}"
-                    )
+            gold_value = row[gold_col]
+            if pd.isna(api_value) or pd.isna(gold_value):
+                continue
+            # sign * (gold - api) > 0 means Gold is more extreme than the API
+            outside = sign * (gold_value - api_value) > ROUNDING_SLACK_C
+            if outside or abs(gold_value - api_value) > SILVER_DAILY_TOLERANCE_C:
+                reason = "outside" if outside else "far inside"
+                differences.append(
+                    f"{row['location_id']}: {gold_col} {gold_value} vs API {api_col} "
+                    f"{api_value} ({reason} the API's daily range)"
+                )
     return differences
 
 

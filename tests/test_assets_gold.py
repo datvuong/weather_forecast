@@ -198,8 +198,50 @@ def test_disagreement_with_silver_daily_is_a_warning(
     assert evaluation.severity == dg.AssetCheckSeverity.WARN
     assert evaluation.metadata["warnings"].value == [
         f"{locations[0].id}: temp_max_c {expected_max} vs API temperature_2m_max "
-        f"{expected_max + 2.0}"
+        f"{expected_max + 2.0} (far inside the API's daily range)"
     ]
+
+
+def _write_silver_daily(pk, location, tmax, tmin):
+    daily = pd.DataFrame(
+        {
+            "location_id": [location.id],
+            "location_name": [location.name],
+            "temperature_2m_max": [tmax],
+            "temperature_2m_min": [tmin],
+        }
+    )
+    path = silver_path("daily", pk)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    daily.to_parquet(path, index=False)
+
+
+def test_small_gap_inside_api_range_is_accepted(
+    data_dir, duckdb_resource, locations, past_date, silver_df
+):
+    # Real behaviour (#32): the API's extremes include the day boundary and sub-hourly data,
+    # so they sit up to ~0.6 °C outside the hourly range
+    local = _local_day(silver_df, locations[0], past_date)["temperature_2m"]
+    _write_silver_daily(past_date.isoformat(), locations[0], local.max() + 0.3, local.min() - 0.6)
+
+    result = _materialize(past_date.isoformat(), duckdb_resource)
+    [evaluation] = result.get_asset_check_evaluations()
+
+    assert evaluation.passed, evaluation.description
+
+
+def test_gold_more_extreme_than_api_is_a_warning(
+    data_dir, duckdb_resource, locations, past_date, silver_df
+):
+    local = _local_day(silver_df, locations[0], past_date)["temperature_2m"]
+    _write_silver_daily(past_date.isoformat(), locations[0], local.max() - 0.2, local.min())
+
+    result = _materialize(past_date.isoformat(), duckdb_resource)
+    [evaluation] = result.get_asset_check_evaluations()
+
+    assert not evaluation.passed
+    assert evaluation.severity == dg.AssetCheckSeverity.WARN
+    assert "outside the API's daily range" in evaluation.description
 
 
 def test_rerun_is_idempotent(data_dir, duckdb_resource, locations, past_date, silver_df):

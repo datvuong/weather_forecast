@@ -1131,7 +1131,7 @@ Recommended: rebuild `gold_daily_temperature` / `gold_daily_precipitation` for *
 - Partition `d` = local date `d`, computed from Silver hourly rows whose `timestamp_local` falls on `d`.
 - Those rows span UTC partitions `d-1` and `d` for positive offsets, or `d` and `d+1` for negative ones, so Gold reads the neighbouring Silver hourly files. It declares a dependency on the adjacent partitions, so Dagster refreshes it when they change.
 - Alternative: derive Gold daily from Silver daily (the API's local-day aggregates). Simpler, but `daytime_*`, `rainy_hours` and `pct_hours_with_rain` still need hourly rows. The API also aggregates days on the response's fixed offset (F6), so days on the other side of a DST change from the request time are shifted by an hour. Option A (true local days from hourly) avoids this.
-- `gold_temperature_check` adds a consistency check against Silver daily `temperature_2m_max/min` (±0.5 °C).
+- `gold_temperature_check` adds a consistency check against Silver daily `temperature_2m_max/min`: a warning if Gold lies outside the API's daily range, or more than 1.0 °C inside it. *(Planned as ±0.5 °C; the re-backfill showed the API's daily extremes include the day boundary and sub-hourly data, at most 0.6 °C beyond the hourly range (#32).)*
 
 #### 9.5.5 Warehouse views
 
