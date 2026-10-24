@@ -26,8 +26,9 @@ flowchart LR
     P6["Phase 6<br/>Scheduling<br/>& Backfill"]
     P7["Phase 7<br/>Quality Checks<br/>& Testing"]
     P8["Phase 8<br/>Dynamic Variables<br/>Hourly · Daily · Current"]
+    P9["Phase 9<br/>Dimensions &<br/>Analytics Readiness"]
 
-    P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7 --> P8
+    P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7 --> P8 --> P9
 ```
 
 ---
@@ -1003,6 +1004,208 @@ Story **#15 `[Story] Phase 8: Dynamic Open-Meteo variables — hourly, daily & c
 | **D4** | Config keys | ✅ Approved: keep `hourly_variables`, add `daily_variables` / `current_variables` |
 
 Out of scope (candidates for later stories): `minutely_15` data (the client design supports it, but no assets), multi-location batching (Open-Meteo accepts comma-separated coordinates), Gold metrics built from API daily aggregates, unit-neutral Gold column names.
+
+---
+
+## Phase 9: Dimensions & Analytics Readiness (WMO codes, locations)
+
+> [!IMPORTANT]
+> **Status: approved 2026-10-25.** D5–D9 approved as recommended; **D10 (order of Phases 10–12) on hold**. Tracked in story **#25** (sub-issues #26–#31). Bug #24 (F6) is fixed first.
+
+### 9.1 — Requests
+
+1. Add Open-Meteo's **WMO weather interpretation codes** to the warehouse as a **dimension table**, so `weather_code` values can be mapped to descriptions and categories.
+2. Include the **location** in the data as a proper entity: a stable key plus attributes, for joins and grouping in analytics.
+3. Research **common analytics on weather forecast data** and assess whether the current data supports them.
+
+### 9.2 — What the pipeline stores today
+
+| Data | Grain | Contents | Notes |
+|---|---|---|---|
+| Silver hourly | city × hour (UTC day partitions) | 8 hourly variables | **No `weather_code`**, `is_day` or `apparent_temperature` |
+| Silver daily | city × local day | 8 daily aggregates (max/min temp, precip sum, sunrise/sunset, …) | **No `weather_code`** |
+| Silver current | city × 15-min snapshot | 8 current variables incl. `weather_code` | `weather_code` stored as float; history only since polling began |
+| Gold daily temperature / precipitation | city × **UTC** day | Aggregates of hourly rows in the UTC partition | See finding F1 |
+| Gold current conditions | city | Latest snapshot | — |
+| Locations | — | Only a `location_name` string, plus the API grid lat/lon repeated on each row | No stable id, elevation, timezone, region or country in the data |
+| Forecast horizon | — | Today's Bronze file holds `past_days=1` + 7 forecast days | Overwritten every hour; Silver/Gold keep only the partition day (F2) |
+| History | — | `backfill_days` (30, max 365) | No climatology baseline (F5) |
+
+### 9.3 — Findings (verified on the backfilled data, 2026-10-24)
+
+| # | Finding | Evidence / impact |
+|---|---|---|
+| **F1** | **Gold "daily" summaries cover UTC days, not local days.** This is *our* aggregation, not the API's. `gold_daily_*` SQL reads the Silver **hourly** file for the partition, whose rows are kept by UTC date. For Australian cities a UTC day runs 10:30–10:30 / 11:00–11:00 local, so each Gold row mixes two local days. The "daytime" columns are worse: one Adelaide row combines 11:00–18:00 of one local day with 06:00–10:00 of the next. The API's **daily** values (Silver daily) are a different thing: Bronze requests them in the location's timezone (D1), so they are local-day aggregates. No contradiction. | Re-measured against our own hourly data grouped by **true local day** (no API daily values involved), 58 complete city-days: Gold differs by ≥ 1 °C on **9** (max temp, worst 4.1 °C, Adelaide 2026-10-21) and **49** (min temp: the UTC window takes in the next local morning's low); precipitation differs by ≥ 1 mm on **16** (worst 19.6 mm). Gold equals the UTC-day aggregate on 62/62. *(The first draft's "25 of 60, worst 8.5 °C" compared against Silver daily rows mislabelled by F6.)* |
+| **F2** | **Forecast vintages aren't kept.** Each hourly run overwrites today's Bronze file, and Silver/Gold only keep the partition day. | No 7-day outlook in Silver/Gold; no "what was forecast for day D, issued at time T"; so no forecast verification, lead-time skill or revision analysis. |
+| **F3** | **No location dimension.** `location_name` is both the key and a file path, and attributes live only in YAML. | Renaming a city breaks history. Can't group by region/country, and the API grid elevation/coordinates aren't modelled. |
+| **F4** | **`weather_code` only in current weather, with no lookup.** | Can't analyse sky/precipitation conditions per hour or day; codes are opaque numbers. |
+| **F5** | **History is short.** | No 30-year baseline for anomalies or the Bureau of Meteorology's Excess Heat Factor (EHF) heatwave method. The archive API goes back to 1940, so a baseline is feasible. |
+| **F6** | **Bug: Silver daily `date_local` is off by one day across DST changes** (#24, a Phase 8.4 regression). Open-Meteo applies **one fixed offset per response** (`utc_offset_seconds` = the current offset) and stamps daily rows at that offset's midnight. Our `epoch_to_local_date()` uses the *true* offset for each date (zoneinfo), so rows on the other side of a DST change are labelled one day early. | All **20 of 20** Silver daily rows before 2026-10-04 (DST start) are mislabelled; all 40 later rows are correct. Melbourne archive request (made in AEDT): `utc_offset_seconds=39600`, and the row for 2026-09-25 is stamped 2026-09-24T13:00Z. Dated correctly, API daily matches the hourly true-local-day aggregates within 0.3 °C. The remainder is the API's own 1-hour window shift for days aggregated on the fixed offset. Fix: date = `(epoch + utc_offset_seconds)` as a UTC date, per Open-Meteo's docs (and plan §8.5). The unit-test fixture shared the wrong assumption, so it also needs fixing. |
+
+Verified API support (2026-10-24): hourly `weather_code`, `is_day`, `apparent_temperature`, `cloud_cover`, and daily `weather_code`, `daylight_duration`, `sunshine_duration` are available on **both** the forecast and archive endpoints. Each response also reports the model **grid cell** coordinates and **elevation** (Adelaide: −34.903, 138.541, 46 m, vs configured −34.9285, 138.6007).
+
+### 9.4 — Common weather-forecast analytics vs current data
+
+Survey of typical uses: energy/utilities, agriculture, operations planning, media, and weather-sensitive businesses. Sources: degree-day practice ([Purdue MRCC](https://mrcc.purdue.edu/resources/growing-degree-day-description), [Wikipedia: Degree day](https://en.wikipedia.org/wiki/Degree-day), [EnergyCAP](https://energycap.com/?p=1728)), forecast verification ([EMS 2021](https://meetingorganizer.copernicus.org/EMS2021/EMS2021-456.html), [ForecastWatch / SciPy 2010](https://proceedings.scipy.org/articles/Majora-92bf1922-006.pdf)), and heatwave definitions ([BoM](https://media.bom.gov.au/social/blog/891/how-will-i-know-if-a-heatwave-is-coming/), [AJEM: Excess Heat Factor](https://knowledge.aidr.org.au/resources/ajem-oct-2016-the-excess-heat-factor-as-a-metric-for-heat-related-fatalities-defining-heatwave-risk-categories/)).
+
+Legend: ✅ supported now · ⚠️ partly / with workarounds · ❌ not supported
+
+| # | Analytic | Typical method | Data needed | Today | Gap → where addressed |
+|---|---|---|---|---|---|
+| A1 | Daily / monthly climate summaries per city | min/max/mean temp, precip totals, rainy days; roll up by month | Local-day daily values | ⚠️ | Silver daily is right, but Gold is per UTC day (F1) → **Phase 9 (D9)** |
+| A2 | Weather-condition distribution ("% of hours rainy / overcast / clear") | Count hours by condition group | Hourly `weather_code` + code lookup | ❌ | F4 → **Phase 9** (config + `dim_weather_code`) |
+| A3 | Dominant / worst condition per day | Daily `weather_code` (= most severe) + severity rank | Daily `weather_code` + lookup | ❌ | F4 → **Phase 9** |
+| A4 | Cross-city comparison, regional roll-ups | Group/rank by city, region, country, elevation | Location attributes and a stable key | ⚠️ | Only `location_name` (F3) → **Phase 9** (`dim_location`) |
+| A5 | Day vs night, diurnal patterns, daylight hours | `is_day`, local hour, `daylight_duration` | `timestamp_local` ✅; `is_day` / daylight not configured | ⚠️ | Config additions → **Phase 9** |
+| A6 | Comfort / "feels like" | `apparent_temperature`, humidity | Hourly `apparent_temperature` | ⚠️ | Only in current; add hourly → **Phase 9** (config) |
+| A7 | Degree days: HDD/CDD (energy), GDD (agriculture) | Σ max(0, base − mean) etc., per local day; bases e.g. 18 °C (HDD/CDD), 10 °C (GDD) | Local-day mean (or max/min) temp | ⚠️ | Computable ad hoc from Silver daily; no mart or configurable bases → **Phase 11** |
+| A8 | Extreme-event flags & streaks: heat days, frost, heavy rain, high gusts, extreme UV, consecutive-day runs | Thresholds + window functions over local days | Local-day daily values | ⚠️ | Computable ad hoc; no thresholds config or mart → **Phase 11** |
+| A9 | Heatwaves (BoM Excess Heat Factor) | 3-day mean vs prior 30 days and the 95th percentile of a 30-year climatology | ≥ 30 days of history **and** a climatology baseline | ❌ | F5 → **Phase 12** |
+| A10 | Anomalies vs normal ("2.3 °C above average") | Value − climatological mean for that calendar day/month | Climatology baseline (e.g. 1991–2020) | ❌ | F5 → **Phase 12** |
+| A11 | Planning outlook ("rain this weekend?", next 7 days) | Query future days by city | Future days in Silver/Gold | ❌ | Only raw in today's Bronze (F2) → **Phase 10** |
+| A12 | Forecast verification / accuracy | Forecast vs observed by lead time: MAE/bias for temperature, hit rate for precipitation | Forecast **vintages** (issued_at, valid_time) + observations (archive reanalysis) | ❌ | F2 → **Phase 10** |
+| A13 | Forecast revisions / volatility | How the forecast for day D changes as D approaches | Forecast vintages | ❌ | F2 → **Phase 10** |
+| A14 | Joining weather to business data (sales, energy load, footfall) | Join on location + local date/hour | Stable location key, local-day grain | ⚠️ | F1/F3 → **Phase 9** |
+
+**Summary:** today's data supports basic hourly analysis and the latest conditions. Phase 9 makes A1–A6 and A14 work properly and prepares the star schema that A7–A13 build on. Forecast-specific analytics (A11–A13) need forecast history (Phase 10), and climate-relative analytics (A9–A10) need a baseline (Phase 12).
+
+### 9.5 — Proposed Phase 9 scope
+
+#### 9.5.1 `dim_weather_code` (D5)
+
+Seeded from Open-Meteo's published table: **29 codes**, including 97 *Heavy thunderstorm*. Codes 96/99 come only from models with explicit hail (e.g. DWD ICON, UKMO); others report 95/97. The seed lives in `config/weather_codes.yaml`, so labels and categories can be edited or translated without code:
+
+```yaml
+weather_codes:
+  - code: 0
+    description: "Clear sky"
+    condition_group: clear          # clear | cloudy | fog | drizzle | rain | snow | showers | thunderstorm
+    precipitation_type: none        # none | drizzle | rain | snow | hail | mixed
+    intensity: none                 # none | slight | moderate | heavy | violent
+    is_precipitation: false
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 0                # ordering for "worst condition" analytics
+  - code: 65
+    description: "Heavy rain"
+    condition_group: rain
+    precipitation_type: rain
+    intensity: heavy
+    is_precipitation: true
+    is_freezing: false
+    is_thunderstorm: false
+    severity_rank: 12
+  # … all 29 codes
+```
+
+- Pydantic-validated (unique codes; enumerated categories).
+- Asset `dim_weather_code` (unpartitioned, new group `dimensions`) → DuckDB table `dim_weather_code` + `data/gold/dimensions/dim_weather_code.parquet`.
+- Check `weather_code_coverage_check`: every `weather_code` seen in Silver (hourly/daily/current) exists in the dimension. Unknown codes fail the check instead of silently showing NULL labels.
+
+#### 9.5.2 `dim_location` + location key in facts (D6, D7)
+
+- `locations.yaml` gains optional fields: `id` (stable key; defaults to a slug of `name`, e.g. `adelaide`), `country`, `region`, and free-form `tags`.
+- Asset `dim_location` (unpartitioned) → DuckDB `dim_location` + Parquet. One row per location. Columns:
+  - `location_id`, `name`, `country`, `region`, `tags`
+  - configured `latitude`/`longitude`, `timezone`, current `utc_offset_minutes`
+  - **from the API:** `grid_latitude`, `grid_longitude`, `elevation_m` (taken from the latest Bronze response, so no extra API calls)
+  - `is_active`
+- Locations removed from config stay in the dimension with `is_active = false`, so historical facts keep resolving (D7).
+- Facts: every Silver and Gold table gets **`location_id`** next to `location_name`. File paths stay by name, so no file migration.
+- Existing data (the 31-day backfill) lacks `location_id`. Re-run the backfill once after deploying (about a minute). Views fall back to joining on name for older files.
+
+#### 9.5.3 Config additions (D8)
+
+Defaults added to `config/variables.yaml`. These are config-only changes, verified on both endpoints:
+
+| Section | Add | Enables |
+|---|---|---|
+| hourly | `weather_code`, `is_day`, `apparent_temperature`, `cloud_cover` | A2, A5, A6 |
+| daily | `weather_code`, `daylight_duration`, `sunshine_duration` | A3, A5 |
+
+Plus an optional `dtype: integer` per variable, so codes and flags (`weather_code`, `is_day`) are stored as nullable integers rather than floats and join cleanly to `dim_weather_code` (D8).
+
+#### 9.5.4 Gold daily on local days (D9, fixes F1)
+
+Recommended: rebuild `gold_daily_temperature` / `gold_daily_precipitation` for **local calendar days**:
+- Partition `d` = local date `d`, computed from Silver hourly rows whose `timestamp_local` falls on `d`.
+- Those rows span UTC partitions `d-1` and `d` for positive offsets, or `d` and `d+1` for negative ones, so Gold reads the neighbouring Silver hourly files. It declares a dependency on the adjacent partitions, so Dagster refreshes it when they change.
+- Alternative: derive Gold daily from Silver daily (the API's local-day aggregates). Simpler, but `daytime_*`, `rainy_hours` and `pct_hours_with_rain` still need hourly rows. The API also aggregates days on the response's fixed offset (F6), so days on the other side of a DST change from the request time are shifted by an hour. Option A (true local days from hourly) avoids this.
+- `gold_temperature_check` adds a consistency check against Silver daily `temperature_2m_max/min` (±0.5 °C).
+
+#### 9.5.5 Warehouse views
+
+The DuckDB warehouse currently holds only Gold tables. Phase 9 adds views so analysts can use SQL across layers with the dimensions:
+
+| View | Definition |
+|---|---|
+| `silver_hourly_weather`, `silver_daily_weather`, `silver_current_weather` | `read_parquet('data/silver/<section>/*.parquet', union_by_name=true)` |
+| `v_hourly_weather` | Silver hourly ⨝ `dim_location` ⨝ `dim_weather_code` (description, condition_group, …) |
+| `v_daily_weather` | Silver daily ⨝ dimensions (dominant condition, daylight hours) |
+| `v_current_conditions` | `gold_current_conditions` ⨝ dimensions |
+
+Created and refreshed by an unpartitioned `warehouse_views` asset (after the dimensions). View SQL lives in `weather_forecast/sql/`.
+
+#### 9.5.6 Jobs, schedules, docs
+
+- `dim_weather_code`, `dim_location` and `warehouse_views` are cheap and idempotent. They run at the end of every `weather_pipeline_job` run, so config edits show up within the hour, and on demand via a new `dimensions_job` (e.g. right after editing `locations.yaml` or `weather_codes.yaml`).
+- User guide: example analytics queries for A1–A6 and A14 (condition distribution, daily summary per region, day/night split, feels-like).
+- AGENTS.md: star-schema conventions (facts carry `location_id`; dimensions are unpartitioned and seeded from YAML).
+
+#### 9.5.7 Tests
+
+- Seed validation: 29 codes, unique, enums.
+- `dim_weather_code` build; coverage check fails on an unknown code.
+- `dim_location`:
+  - id defaulting/slug
+  - grid coords and elevation taken from Bronze
+  - removed location → `is_active = false`
+- `location_id` present in every Silver/Gold table.
+- `dtype: integer` columns are `Int64` with nulls preserved.
+- Gold local-day aggregation across UTC partitions, including Adelaide's DST start, and agreement with Silver daily.
+- Views exist and join correctly; a query joining old files (no `location_id`) still works.
+
+### 9.6 — Roadmap after Phase 9 (candidate stories, not in scope)
+
+| Phase | Story | Unlocks | Key design points |
+|---|---|---|---|
+| **10** | Forecast history (vintages) | A11 outlook, A12 verification, A13 revisions | Keep every forecast run append-only, like current weather: `silver_forecast` keyed by (location, `issued_at`, `valid_time`) with `lead_hours`. Verification joins against archive "actuals" once available (≈ 2–5 days lag). Storage grows ~24 runs × 7 days × 24 h per city per day; partition by issue date. |
+| **11** | Analytics marts | A7 degree days, A8 extremes/streaks, monthly summaries, condition distribution | Config-driven bases/thresholds (e.g. HDD/CDD 18 °C, GDD 10 °C; heat day ≥ 35 °C; heavy rain ≥ 10 mm). Gold tables `gold_degree_days`, `gold_weather_events`, `gold_monthly_summary`. |
+| **12** | Climatology baseline | A9 EHF heatwaves, A10 anomalies | One-off archive backfill of daily means for 1991–2020 per city (≈ 11k days/city, chunked requests). `gold_climatology` (day-of-year normals, percentiles) and EHF per BoM method. |
+
+### 9.7 — Data and compatibility impact
+
+- **Schema:** new columns (`location_id`, new variables) are additive. Old Silver files read with `union_by_name` show NULLs; one re-backfill fills them.
+- **Gold daily (if D9 = local day):** semantics change from UTC day to local day for the same `date` value. The existing Gold rows are replaced by the re-backfill; document as a breaking change.
+- **API calls:** unchanged (more variables per call, same number of calls).
+
+### 9.8 — Tracking (per AGENTS.md workflow)
+
+Story **#25 `[Story] Phase 9: Dimensions & analytics readiness`**, with sub-issues #26–#31 and one commit each:
+
+| # | Issue | Scope | Est. |
+|---|---|---|---|
+| 9.1 (#26) | `[Task]` Config: location `id`/`country`/`region`/`tags`; variable `dtype`; default variable additions | §9.5.2–9.5.3 | 45 min |
+| 9.2 (#27) | `[Task]` `dim_weather_code` seed + asset + coverage check | §9.5.1 | 1 h |
+| 9.3 (#28) | `[Task]` `dim_location` + `location_id` in all facts | §9.5.2 | 1.5 h |
+| 9.4 (#29) | `[Task]` Gold daily on local days (D9) | §9.5.4 | 1.5 h |
+| 9.5 (#30) | `[Task]` Warehouse views + dimensions job | §9.5.5–9.5.6 | 1 h |
+| 9.6 (#31) | `[Task]` Docs: user-guide analytics queries, AGENTS star-schema conventions | §9.5.6 | 45 min |
+
+**Prerequisite:** bug **#24** (F6) is fixed first, as its own commit, since Phase 9's daily analytics and the Gold/Silver consistency check depend on correct daily dates.
+
+**Total: ~6.5 hours.** Phases 10–12 get their own stories once Phase 9 lands and you choose their priority (D10).
+
+### 9.9 — Decisions
+
+| # | Decision | Options | Outcome |
+|---|---|---|---|
+| **D5** | Where the WMO code table lives | **A.** Seed YAML in `config/` (editable labels/categories) · B. Hard-coded in Python | ✅ Approved: **A** |
+| **D6** | How location enters the data | **A.** Star schema: `location_id` in facts + `dim_location` (+ convenience views) · B. Denormalize attributes (country, elevation, …) into every fact row | ✅ Approved: **A** (keep `location_name` too, for readability) |
+| **D7** | Removed locations | **A.** Keep in `dim_location` with `is_active = false` · B. Drop from the dimension | ✅ Approved: **A** |
+| **D8** | Codes/flags type + default variable additions | Optional `dtype: integer` + hourly `weather_code`, `is_day`, `apparent_temperature`, `cloud_cover`; daily `weather_code`, `daylight_duration`, `sunshine_duration` · or keep floats and cast in views | ✅ Approved: **dtype + additions** |
+| **D9** | Gold daily grain (F1) | **A.** Local calendar day from hourly (reads neighbouring UTC partitions) · B. Derive from Silver daily (API aggregates; 1-hour DST window caveat, F6) · C. Keep UTC day | ✅ Approved: **A** |
+| **D10** | Order of later phases | 10 Forecast history · 11 Analytics marts · 12 Climatology | ⏸ On hold (recommended 10 → 11 → 12) |
 
 ---
 
