@@ -164,7 +164,13 @@ def load_local_day_hourly(partition_date: str) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame()
     hourly = fill_location_ids(pd.concat(frames, ignore_index=True))
-    return hourly[hourly["timestamp_local"].dt.date == day].reset_index(drop=True)
+    hourly = hourly[hourly["timestamp_local"].dt.date == day]
+    # Each Silver file should hold only its own UTC day; don't rely on it, since an
+    # overlapping hour would be counted twice in sums and hours_covered
+    hourly = hourly.sort_values("ingestion_timestamp", kind="stable").drop_duplicates(
+        subset=["location_id", "timestamp_utc"], keep="last"
+    )
+    return hourly.sort_values(["location_id", "timestamp_utc"]).reset_index(drop=True)
 
 
 def _load_hourly(context: AssetExecutionContext) -> pd.DataFrame | None:
@@ -397,32 +403,15 @@ def _silver_daily_differences(df: pd.DataFrame, partition_date: str) -> list[str
     return differences
 
 
-@asset_check(
-    asset=gold_daily_temperature,
-    description=(
-        "Validate Gold temperature: keys, row count, min <= avg <= max (errors); "
-        "complete local day and agreement with Silver daily (warnings)."
-    ),
-)
-def gold_temperature_check(context) -> AssetCheckResult:
-    """Validate Gold daily temperature aggregations."""
-    partition_date_str = context.partition_key
-    gold_file = gold_path("daily_temperature", partition_date_str)
-
-    if not gold_file.exists():
-        return AssetCheckResult(
-            passed=False,
-            metadata={"error": "Gold temperature file not found"},
-        )
-
-    df = pd.read_parquet(str(gold_file))
+def temperature_issues(df: pd.DataFrame, num_locations: int) -> tuple[list[str], list[str]]:
+    """(errors, warnings) for one partition of gold_daily_temperature, excluding the
+    comparison with Silver daily (which needs that partition's file)."""
     errors: list[str] = []
     warnings: list[str] = []
 
     # Check one row per configured location
-    expected_rows = len(load_locations_config())
-    if len(df) != expected_rows:
-        errors.append(f"Row count {len(df)} != {expected_rows} configured locations")
+    if len(df) != num_locations:
+        errors.append(f"Row count {len(df)} != {num_locations} configured locations")
 
     # Check no null keys
     for key in ("location_id", "location_name", "date"):
@@ -444,8 +433,30 @@ def gold_temperature_check(context) -> AssetCheckResult:
     for _, row in df.iterrows():
         hours = row.get("hours_covered")
         if pd.isna(hours) or not low <= hours <= high:
-            warnings.append(f"{row['location_id']}: only {hours} hours of the local day")
+            warnings.append(f"{row.get('location_id', '?')}: only {hours} hours of the local day")
+    return errors, warnings
 
+
+@asset_check(
+    asset=gold_daily_temperature,
+    description=(
+        "Validate Gold temperature: keys, row count, min <= avg <= max (errors); "
+        "complete local day and agreement with Silver daily (warnings)."
+    ),
+)
+def gold_temperature_check(context) -> AssetCheckResult:
+    """Validate Gold daily temperature aggregations."""
+    partition_date_str = context.partition_key
+    gold_file = gold_path("daily_temperature", partition_date_str)
+
+    if not gold_file.exists():
+        return AssetCheckResult(
+            passed=False,
+            metadata={"error": "Gold temperature file not found"},
+        )
+
+    df = pd.read_parquet(str(gold_file))
+    errors, warnings = temperature_issues(df, len(load_locations_config()))
     warnings += _silver_daily_differences(df, partition_date_str)
 
     issues = errors + warnings

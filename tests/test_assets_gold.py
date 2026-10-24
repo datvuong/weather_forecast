@@ -292,6 +292,32 @@ def test_rerun_without_input_clears_stale_rows(data_dir, duckdb_resource, locati
     assert not evaluation.passed  # no longer passes on a stale file
 
 
+def test_overlapping_hour_in_neighbour_file_is_counted_once(
+    data_dir, duckdb_resource, locations, past_date, silver_df
+):
+    # Silver files should each hold only their own UTC day; if a neighbour file ever
+    # repeated an hour, Gold must not count it twice (latest ingestion wins) (#42)
+    pk = past_date.isoformat()
+    loc = locations[0]
+    own_day = pd.read_parquet(silver_path("hourly", pk))
+    row = own_day[
+        (own_day["location_id"] == loc.id) & (own_day["timestamp_local"].dt.date == past_date)
+    ].head(1).copy()
+    row["temperature_2m"] = 99.0
+    row["ingestion_timestamp"] = row["ingestion_timestamp"] + pd.Timedelta(hours=1)
+    neighbour = silver_path("hourly", (past_date - timedelta(days=1)).isoformat())
+    pd.concat([pd.read_parquet(neighbour), row], ignore_index=True).to_parquet(neighbour)
+
+    _materialize(pk, duckdb_resource)
+
+    gold = duckdb_resource.query(
+        f"SELECT temp_max_c, hours_covered FROM gold_daily_temperature "
+        f"WHERE location_id = '{loc.id}'"
+    ).iloc[0]
+    assert gold["hours_covered"] == 24
+    assert gold["temp_max_c"] == 99.0
+
+
 def test_rerun_is_idempotent(data_dir, duckdb_resource, locations, past_date, silver_df):
     pk = past_date.isoformat()
 

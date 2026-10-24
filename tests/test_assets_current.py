@@ -182,6 +182,9 @@ class TestSilverCurrent:
         assert one.loc[pd.Timestamp(t1), "temperature_2m"] == 12.0
         assert one.loc[pd.Timestamp(t2), "temperature_2m"] == 11.0
         assert (df["interval_seconds"] == 900).all()
+        assert dict(zip(df["location_name"], df["location_id"])) == {
+            loc.name: loc.id for loc in locations
+        }
         adelaide = df[df["location_name"] == "Adelaide"].iloc[0]
         expected_local = pd.Timestamp(t1).tz_convert("Australia/Adelaide").tz_localize(None)
         assert adelaide["observed_at_local"] == expected_local

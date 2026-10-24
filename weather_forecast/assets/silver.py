@@ -448,6 +448,36 @@ def _missing_file_result(path: Path, partition_date: str) -> AssetCheckResult:
     )
 
 
+def hourly_quality_issues(
+    df: pd.DataFrame, num_locations: int, definitions: list[VariableDefinition]
+) -> list[str]:
+    """Issues found in one partition of hourly Silver data (empty list = passes)."""
+    issues: list[str] = []
+
+    # 1. Row count: expect ~24 rows per location per day
+    expected_min = num_locations * 20  # Allow some missing hours
+    expected_max = num_locations * 24
+    if len(df) < expected_min:
+        issues.append(f"Row count {len(df)} below expected minimum {expected_min}")
+    elif len(df) > expected_max:
+        issues.append(f"Row count {len(df)} above expected maximum {expected_max}")
+
+    # 2. Null rate for temperature (should be < 5%)
+    if "temperature_2m" in df.columns and len(df) > 0:
+        temp_null_pct = df["temperature_2m"].isna().sum() / len(df) * 100
+        if temp_null_pct > 5.0:
+            issues.append(f"temperature_2m null rate {temp_null_pct:.1f}% exceeds 5%")
+
+    # 3. Value range checks (valid_range in config)
+    issues += range_issues(df, definitions)
+
+    # 4. No duplicate (location_id, timestamp_utc) pairs
+    dupes = df.duplicated(subset=SECTION_KEYS["hourly"]).sum()
+    if dupes > 0:
+        issues.append(f"{dupes} duplicate (location, timestamp) pairs found")
+    return issues
+
+
 @asset_check(
     asset=silver_hourly_weather,
     description=(
@@ -462,31 +492,9 @@ def silver_quality_check(context) -> AssetCheckResult:
         return _missing_file_result(silver_file, partition_date_str)
 
     df = pd.read_parquet(str(silver_file))
-    locations = load_locations_config()
-    issues: list[str] = []
-
-    # 1. Row count: expect ~24 rows per location per day
-    expected_min = len(locations) * 20  # Allow some missing hours
-    expected_max = len(locations) * 24
-    if len(df) < expected_min:
-        issues.append(f"Row count {len(df)} below expected minimum {expected_min}")
-    elif len(df) > expected_max:
-        issues.append(f"Row count {len(df)} above expected maximum {expected_max}")
-
-    # 2. Null rate for temperature (should be < 5%)
-    if "temperature_2m" in df.columns and len(df) > 0:
-        temp_null_pct = df["temperature_2m"].isna().sum() / len(df) * 100
-        if temp_null_pct > 5.0:
-            issues.append(f"temperature_2m null rate {temp_null_pct:.1f}% exceeds 5%")
-
-    # 3. Value range checks (valid_range in config)
-    issues += range_issues(df, load_variables_config().hourly_variables)
-
-    # 4. No duplicate (location_name, timestamp_utc) pairs
-    dupes = df.duplicated(subset=SECTION_KEYS["hourly"]).sum()
-    if dupes > 0:
-        issues.append(f"{dupes} duplicate (location, timestamp) pairs found")
-
+    issues = hourly_quality_issues(
+        df, len(load_locations_config()), load_variables_config().hourly_variables
+    )
     return check_result(df, issues, partition_date_str)
 
 

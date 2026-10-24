@@ -183,6 +183,8 @@ No code changes are needed: Bronze requests it, and Silver adds it as a column w
 - The `data_dir` fixture sets `WEATHER_FORECAST_DATA_DIR`, which `get_data_dir()` honours; never write to the real `data/` in tests
 - The `variables_config` fixture writes a temp `variables.yaml` (via `WEATHER_FORECAST_CONFIG_DIR`) and clears the loader caches; use it to test config-driven behaviour
 - Tests must not hit the network: mock HTTP with `respx` or pass `FakeOpenMeteoClient`
+- Quality-check logic lives in plain functions (`hourly_quality_issues`, `temperature_issues`); every condition needs a failing-case test in `tests/test_quality_checks.py`
+- Test fixtures report a distinct model grid cell per city (`GRID_CELLS`), different from the configured coordinates, so grid-vs-config regressions are caught
 
 ## Conventions
 

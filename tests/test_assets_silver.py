@@ -278,6 +278,9 @@ class TestSilverHourly:
         assert df["cloud_cover"].dtype == "float64"
 
     def test_deduplicates_keeping_latest_ingestion(self, data_dir, locations, past_date):
+        # Bronze writes one response per file in production, so two rows in one file is
+        # synthetic: it exercises the dedup rule itself (latest ingestion wins), which
+        # matters in production for current-weather re-polls (see test_assets_current)
         pk = past_date.isoformat()
         older = datetime(2026, 10, 24, 1, tzinfo=timezone.utc)
         newer = older + timedelta(hours=1)
@@ -343,6 +346,9 @@ class TestSilverDaily:
         df = pd.read_parquet(silver_path("daily", pk))
         assert list(df.columns) == section_columns("daily", config.daily_names)
         assert sorted(df["location_name"]) == sorted(loc.name for loc in locations)
+        assert dict(zip(df["location_name"], df["location_id"])) == {
+            loc.name: loc.id for loc in locations
+        }
         assert (df["date_local"] == past_date).all()
         assert str(df["sunrise"].dt.tz) == "UTC"
         assert df["temperature_2m_max"].dtype == "float64"
