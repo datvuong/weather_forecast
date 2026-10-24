@@ -1010,7 +1010,7 @@ Out of scope (candidates for later stories): `minutely_15` data (the client desi
 ## Phase 9: Dimensions & Analytics Readiness (WMO codes, locations)
 
 > [!IMPORTANT]
-> **Status: approved 2026-10-25.** D5–D9 approved as recommended; **D10 (order of Phases 10–12) on hold**. Tracked in story **#25** (sub-issues #26–#31). Bug #24 (F6) is fixed first.
+> **Status: implemented 2026-10-25.** D5–D9 approved as recommended; **D10 (order of Phases 10–12) on hold**. Tracked in story **#25** (sub-issues #26–#31, follow-up bug #32), one commit each; bug #24 (F6) fixed first. Re-backfill `fbbhbkit` (31 partitions, 64 runs) succeeded on 2026-10-25.
 
 ### 9.1 — Requests
 

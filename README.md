@@ -6,10 +6,11 @@ End-to-end weather forecast data pipeline using **Medallion Architecture** built
 
 - 🥉 **Bronze Layer** — Raw weather data ingested from Open-Meteo API
 - 🥈 **Silver Layer** — Cleaned, validated, and typed hourly and daily records, with one column per configured variable
-- 🥇 **Gold Layer** — Daily temperature trends and precipitation summaries
+- 🥇 **Gold Layer** — Daily temperature and precipitation summaries per **local** calendar day
+- 🧭 **Dimensions** — `dim_location` (region, country, elevation) and `dim_weather_code` (WMO code labels and categories), joined in ready-made DuckDB views
 - 🌡️ **Current conditions** — 15-minute snapshot history plus a "latest conditions" table
 - ⏰ **Scheduling** — Hourly pipeline refresh plus a 15-minute current-weather poll via Dagster
-- 📊 **DuckDB analytics** — Fast local queries on aggregated data
+- 📊 **DuckDB analytics** — SQL over Gold, Silver and the dimensions (`v_hourly_weather`, `v_daily_weather`, `v_current_conditions`)
 - ✅ **Data quality checks** — Built-in asset checks at every layer
 - 🔧 **Configurable** — Add locations and any Open-Meteo hourly/daily/current variable via YAML, with no code changes
 
@@ -50,15 +51,24 @@ dagster dev
 
 ```yaml
 locations:
-  - name: Melbourne
+  - id: melbourne              # optional stable key (defaults to a slug of name)
+    name: Melbourne
     latitude: -37.8136
     longitude: 144.9631
     timezone: Australia/Melbourne
-  - name: Adelaide
-    latitude: -34.9285
-    longitude: 138.6007
-    timezone: Australia/Adelaide
+    country: Australia         # optional: country / region / tags for analytics
+    region: Victoria
+    tags: [capital]
 ```
+
+Every table carries `location_id`, joined to the `dim_location` dimension. Removed locations stay there
+as inactive, so their history still resolves.
+
+### Weather codes (`config/weather_codes.yaml`)
+
+The 29 WMO weather interpretation codes Open-Meteo uses, with descriptions and analytics categories
+(`condition_group`, `precipitation_type`, `intensity`, flags, `severity_rank`). They seed
+`dim_weather_code`, and you can edit labels without code changes.
 
 ### Weather Variables (`config/variables.yaml`)
 
@@ -111,7 +121,17 @@ Open-Meteo API
 │ Parquet   │    │ Parquet   │    │ Parquet  │
 └──────────┘    └──────────┘    │ + DuckDB │
                                 └──────────┘
+                     dim_location · dim_weather_code
+                     DuckDB views: silver_*, v_hourly_weather,
+                     v_daily_weather, v_current_conditions
 ```
+
+| Layer | Grain | Storage |
+|---|---|---|
+| Bronze | raw response per city per UTC day (+ current snapshots) | `data/bronze/` |
+| Silver | city × hour (UTC day partitions), city × local day, city × 15-min snapshot | `data/silver/{hourly,daily,current}/` + DuckDB views |
+| Gold | city × **local** day; latest current conditions | `data/gold/` + DuckDB tables |
+| Dimensions | one row per location / per WMO code | `data/gold/dimensions/` + DuckDB tables |
 
 ## Scheduling
 
@@ -119,11 +139,16 @@ Open-Meteo API
 |---|---|---|---|
 | `hourly_weather_schedule` | `weather_pipeline_job` | every hour at `:00` UTC | Bronze → Silver (hourly + daily) → Gold for **today's UTC partition**, refreshing the latest forecast |
 | `current_weather_schedule` | `current_weather_job` | every `current_interval_minutes` (default 15) | Snapshot of current conditions → Silver history → `gold_current_conditions` |
+| — | `dimensions_job` | on demand | Rebuild `dim_location`, `dim_weather_code` and the DuckDB views (they also run at the end of every pipeline run) |
+
+Each hourly tick also refreshes **yesterday's** Gold summaries, because Gold days are local days and
+can include hours from today's UTC partition.
 
 Turn them on in the Dagster UI under **Automation → Schedules and sensors**. Schedules start stopped. UI steps are for Dagster 1.13; see the [User Guide](docs/user-guide.md#finding-your-way-around-the-ui).
 
-Partitions are **UTC calendar days**: in Adelaide (UTC+10:30) the `2026-10-24` partition covers
-10:30 on the 24th to 09:30 on the 25th, local time. Each hourly Silver row has both
+Bronze and Silver partitions are **UTC calendar days**: in Adelaide (UTC+10:30) the `2026-10-24`
+partition covers 10:30 on the 24th to 09:30 on the 25th, local time. **Gold** partitions are
+**local** calendar days: Gold `2026-10-24` is the 24th in each city's own timezone. Each hourly Silver row has both
 `timestamp_utc` and `timestamp_local`. Hourly values are on the location's local whole hours,
 so for half-hour-offset timezones like Adelaide they fall at `:30` UTC. Daily rows cover the
 location's local calendar day equal to the partition date. (Open-Meteo builds daily values with the
@@ -179,7 +204,9 @@ ruff check .              # Lint
 | `tests/test_assets_bronze.py` | Endpoint selection, location-timezone unixtime window, archive→forecast fallback, file check |
 | `tests/test_assets_silver.py` | Config-driven hourly/daily parsing, DST, new-variable-without-code-change, dedup, quality checks |
 | `tests/test_assets_current.py` | Snapshot files, same-slot idempotency, history rebuild, latest conditions, freshness |
-| `tests/test_assets_gold.py` | Daily aggregations, DuckDB upsert idempotency, temperature check, Gold config requirements |
+| `tests/test_assets_gold.py` | Local-day aggregations across UTC partitions (incl. DST), upsert idempotency, schema migration, temperature check, Gold config requirements |
+| `tests/test_dimensions.py` | WMO code seed, `dim_weather_code`, `dim_location` (grid data, inactive locations), coverage checks |
+| `tests/test_warehouse.py` | DuckDB views and joins, name fallback for old files, fan-out check, job wiring |
 | `tests/test_duckdb_resource.py` | DuckDB queries and writer-lock retries |
 | `tests/test_schedules.py` | Schedules target the UTC partition, job selections, current cadence, API budget, Definitions load |
 

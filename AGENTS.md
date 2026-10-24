@@ -20,7 +20,8 @@ This is an **end-to-end weather forecast data pipeline** using **Medallion Archi
 |---|---|---|
 | **Bronze** | Raw API responses preserved as-is | `data/bronze/{location}/{date}.parquet` (hourly + daily), `data/bronze/current/{location}/{date}/{HHMM}.parquet` (snapshots) |
 | **Silver** | Cleaned, typed, deduplicated records, one column per configured variable | `data/silver/{hourly,daily,current}/{date}.parquet` |
-| **Gold** | Aggregated daily summaries + latest current conditions | `data/gold/{metric}/{date}.parquet`, `data/gold/current_conditions/latest.parquet` + `warehouse/weather.duckdb` |
+| **Gold** | Daily summaries per **local** calendar day + latest current conditions | `data/gold/{metric}/{date}.parquet`, `data/gold/current_conditions/latest.parquet` + `warehouse/weather.duckdb` |
+| **Dimensions** | `dim_location`, `dim_weather_code` (unpartitioned, seeded from YAML) + DuckDB views over Silver | `data/gold/dimensions/*.parquet` + `warehouse/weather.duckdb` |
 
 ## Project Structure
 
@@ -29,15 +30,18 @@ weather_forecast/
 ├── pyproject.toml                  # Dependencies and project metadata
 ├── dagster.yaml                    # Dagster instance configuration
 ├── config/
-│   ├── locations.yaml              # Configurable list of cities to track
-│   └── variables.yaml              # Configurable weather variables and API settings
+│   ├── locations.yaml              # Configurable list of cities to track (id, attributes)
+│   ├── variables.yaml              # Configurable weather variables and API settings
+│   └── weather_codes.yaml          # WMO weather code labels/categories (seed for dim_weather_code)
 ├── weather_forecast/               # Main Python package
 │   ├── definitions.py              # Dagster entry point — wires assets, resources, schedules
 │   ├── assets/
 │   │   ├── bronze.py               # Bronze layer: raw API ingestion
 │   │   ├── silver.py               # Silver layer: config-driven parsing and validation (hourly, daily)
 │   │   ├── current.py              # Current weather: snapshots → history → latest conditions
-│   │   └── gold.py                 # Gold layer: daily aggregations + config requirements
+│   │   ├── gold.py                 # Gold layer: local-day aggregations + config requirements
+│   │   ├── dimensions.py           # dim_weather_code, dim_location + their checks
+│   │   └── warehouse.py            # DuckDB views over Silver, joined to the dimensions
 │   ├── resources/
 │   │   ├── api_client.py           # Open-Meteo API wrapper (ConfigurableResource)
 │   │   └── duckdb_resource.py      # DuckDB connection manager (ConfigurableResource)
@@ -100,13 +104,16 @@ Edit `config/locations.yaml`:
 ```yaml
 locations:
   # ... existing locations ...
-  - name: Sydney
+  - id: sydney               # optional; defaults to a slug of name. Never change it once data exists
+    name: Sydney
     latitude: -33.8688
     longitude: 151.2093
     timezone: Australia/Sydney
+    country: Australia       # optional: country, region, tags
+    region: New South Wales
 ```
 
-No code changes needed. The pipeline will automatically include the new location on the next run.
+No code changes needed. The pipeline will automatically include the new location on the next run, and `dim_location` picks up its grid coordinates and elevation from the first Bronze response. Ids and names must be unique, and the timezone must be a valid IANA name. Removing a location keeps it in `dim_location` with `is_active = false`.
 
 ## Adding a Weather Variable
 
@@ -119,12 +126,14 @@ hourly_variables:
     description: "Total cloud cover"
     unit: "%"
     valid_range: [0, 100]   # optional: checked by the Silver quality checks
+    dtype: float            # optional: float (default) | integer (codes/flags → nullable Int64)
 ```
 
 No code changes are needed: Bronze requests it, and Silver adds it as a column with a Pydantic model built from the config. Notes:
 - The name must be a valid Open-Meteo parameter **for that section** (see https://open-meteo.com/en/docs). An invalid name fails the run with Open-Meteo's `reason`.
 - Variables an endpoint doesn't provide (unit `"undefined"`, e.g. `precipitation_probability` from the archive) become null columns and are listed in the asset metadata.
-- A `unit` of `iso8601`/`unixtime` marks a time-valued variable (e.g. `sunrise`), stored as a UTC timestamp. Everything else is `float64`.
+- A `unit` of `iso8601`/`unixtime` marks a time-valued variable (e.g. `sunrise`), stored as a UTC timestamp. `dtype: integer` variables are nullable `Int64`; everything else is `float64`.
+- New `weather_code` values must exist in `config/weather_codes.yaml`; the `*_weather_code_check` checks fail otherwise.
 - Variable names must be unique within a section and must not clash with Silver key columns (`time`, `location_name`, `timestamp_utc`, …).
 - Other API parameters go in `settings.extra_params` (pipeline-controlled ones like `timezone` are rejected).
 - Gold needs certain hourly variables and metric units (`REQUIRED_HOURLY_VARIABLES` / `REQUIRED_UNITS` in `assets/gold.py`). The definitions fail to load if the config removes them.
@@ -136,8 +145,9 @@ No code changes are needed: Bronze requests it, and Silver adds it as a column w
 | **Software-Defined Assets** | `assets/*.py` | Each Medallion layer is a Dagster asset |
 | **ConfigurableResource** | `resources/*.py` | API client and DuckDB connections are injected resources |
 | **DailyPartitionsDefinition** | `partitions.py` | Each partition = one day of weather data |
-| **Unpartitioned asset** | `assets/current.py` | `gold_current_conditions` is overwritten with the latest snapshot per location |
-| **Asset jobs + schedules** | `schedules.py` | `weather_pipeline_job` (hourly, backfillable) and `current_weather_job` (every `current_interval_minutes`) both target today's partition |
+| **Unpartitioned asset** | `assets/current.py`, `dimensions.py`, `warehouse.py` | `gold_current_conditions`, the dimensions and `warehouse_views` are rebuilt in full |
+| **TimeWindowPartitionMapping** | `assets/gold.py` | Gold partition `d` (a local day) depends on Silver hourly partitions `d-1..d+1` |
+| **Asset jobs + schedules** | `schedules.py` | `weather_pipeline_job` (hourly, backfillable; ends with dimensions + views, and also refreshes yesterday's Gold), `current_weather_job` (every `current_interval_minutes`), `dimensions_job` (on demand) |
 | **Asset Checks** | `assets/*.py` | Data quality validation after each layer |
 
 ## API Details
@@ -177,10 +187,13 @@ No code changes are needed: Bronze requests it, and Silver adds it as a column w
 ## Conventions
 
 - All timestamps stored in **UTC** (with a separate `timestamp_local` column)
-- Partitions are **UTC calendar days**. The API is queried in each location's timezone with `timeformat=unixtime`. Hourly rows are kept by UTC date, with `timestamp_local` from zoneinfo (DST-correct). Daily rows are kept by the date from `daily_epoch_to_date()` (fixed response offset, as Open-Meteo documents). Use `utc_today()`, never `date.today()`
+- Bronze/Silver partitions are **UTC calendar days** (Gold: local days, see below). The API is queried in each location's timezone with `timeformat=unixtime`. Hourly rows are kept by UTC date, with `timestamp_local` from zoneinfo (DST-correct). Daily rows are kept by the date from `daily_epoch_to_date()` (fixed response offset, as Open-Meteo documents). Use `utc_today()`, never `date.today()`
 - Don't add `from __future__ import annotations` to asset modules: Dagster rejects the stringified `context: AssetExecutionContext` hint
 - Parquet files use **snappy** compression
-- DuckDB Gold tables use **upsert** semantics (idempotent re-runs); `gold_current_conditions` is replaced on each run
+- DuckDB Gold tables use **upsert** semantics (idempotent re-runs, `INSERT ... BY NAME`); `ensure_table()` recreates a derived table whose schema changed (re-run the backfill afterwards). `gold_current_conditions` and the dimensions are replaced on each run
+- **Gold partitions are local calendar days** (each location's own timezone), built from Silver hourly rows across UTC partitions `d-1..d+1`; Silver partitions remain UTC days
+- **Star schema:** every fact table carries `location_id` (plus `location_name` for readability). Join dimensions on `location_id` and `weather_code`; never copy dimension attributes into facts. Dimensions are unpartitioned and seeded from YAML in `config/`
+- `warehouse_views` generates view SQL from the columns that exist; add new analytic views there, and keep the row-count (fan-out) check passing
 - Never hard-code variable names outside Gold: Bronze/Silver read them from config
 - Config changes go in **YAML files**, not Python code
 - Weather variable nulls are **preserved** (e.g., UV index is null at night)
