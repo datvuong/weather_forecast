@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import yaml
 
@@ -136,13 +135,18 @@ def epoch_to_utc(seconds: int | float) -> datetime:
     return datetime.fromtimestamp(seconds, tz=timezone.utc)
 
 
-def epoch_to_local_date(seconds: int | float, tz_name: str) -> date:
-    """Return the calendar date of a UTC epoch in an IANA timezone (DST-safe).
+def daily_epoch_to_date(seconds: int | float, utc_offset_seconds: int) -> date:
+    """Return the date of an Open-Meteo daily row in unixtime format.
 
-    Open-Meteo daily rows in unixtime format are stamped with the epoch of
-    local midnight, so this yields the local day the aggregate covers.
+    Open-Meteo applies one fixed UTC offset per response (`utc_offset_seconds`,
+    the location's offset at request time) and stamps each daily row with
+    local midnight under that offset. The date must therefore be recovered
+    with the same fixed offset, as Open-Meteo documents ("apply
+    utc_offset_seconds again"). Converting with the true per-date offset
+    (zoneinfo) would label rows across a DST change one day off.
     """
-    return datetime.fromtimestamp(seconds, tz=ZoneInfo(tz_name)).date()
+    local = datetime.fromtimestamp(seconds, tz=timezone.utc) + timedelta(seconds=utc_offset_seconds)
+    return local.date()
 
 
 def api_calls_per_day(num_locations: int, config: VariablesConfig) -> int:

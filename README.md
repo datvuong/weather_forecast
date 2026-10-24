@@ -126,7 +126,9 @@ Partitions are **UTC calendar days**: in Adelaide (UTC+10:30) the `2026-10-24` p
 10:30 on the 24th to 09:30 on the 25th, local time. Each hourly Silver row has both
 `timestamp_utc` and `timestamp_local`. Hourly values are on the location's local whole hours,
 so for half-hour-offset timezones like Adelaide they fall at `:30` UTC. Daily rows cover the
-location's local calendar day equal to the partition date.
+location's local calendar day equal to the partition date. (Open-Meteo builds daily values with the
+offset in effect when the data was requested, so for days across a daylight-saving change the
+day's window is shifted by an hour.)
 
 ## Current Weather
 

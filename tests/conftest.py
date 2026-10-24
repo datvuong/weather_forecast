@@ -38,14 +38,17 @@ def make_api_response(
     daily_variables: list[str] | tuple[str, ...] = (),
     tz: str = "Australia/Adelaide",
     unsupported: list[str] | tuple[str, ...] = (),
+    utc_offset_seconds: int | None = None,
 ) -> dict:
     """Build an Open-Meteo-style response in unixtime format (as Bronze requests it).
 
     Hourly rows cover `days` UTC days from `start` 00:00 UTC. Temperature rises
     by 0.5 °C per hour from temperature_base, so the expected min/max/avg for a
-    day are easy to compute. Daily rows (if requested) are stamped with the
-    epoch of local midnight in `tz`, like the real API. Variables listed in
-    `unsupported` get unit "undefined" and null values.
+    day are easy to compute. Like the real API, the response carries ONE fixed
+    offset (`utc_offset_seconds`; default: tz's offset at `start`, standing in
+    for "the offset at request time"), and daily rows are stamped with local
+    midnight under that fixed offset, even for dates across a DST change.
+    Variables listed in `unsupported` get unit "undefined" and null values.
     """
     variables = VARIABLES if variables is None else variables
     hours = 24 * days
@@ -70,10 +73,13 @@ def make_api_response(
         ]
         hourly_units[var] = "undefined" if var in unsupported else "x"
 
+    if utc_offset_seconds is None:
+        utc_offset_seconds = int(ZoneInfo(tz).utcoffset(utc_start).total_seconds())
+    response_tz = timezone(timedelta(seconds=utc_offset_seconds))
     response = {
         "latitude": -34.9,
         "longitude": 138.6,
-        "utc_offset_seconds": int(ZoneInfo(tz).utcoffset(utc_start).total_seconds()),
+        "utc_offset_seconds": utc_offset_seconds,
         "timezone": tz,
         "hourly_units": hourly_units,
         "hourly": hourly,
@@ -81,7 +87,7 @@ def make_api_response(
 
     if daily_variables:
         local_midnights = [
-            datetime.combine(start + timedelta(days=d), datetime.min.time(), tzinfo=ZoneInfo(tz))
+            datetime.combine(start + timedelta(days=d), datetime.min.time(), tzinfo=response_tz)
             for d in range(days)
         ]
         daily_generators = {

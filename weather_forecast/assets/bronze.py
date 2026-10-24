@@ -36,7 +36,7 @@ from weather_forecast.resources.api_client import (
     unsupported_variables,
 )
 from weather_forecast.utils.helpers import (
-    epoch_to_local_date,
+    daily_epoch_to_date,
     epoch_to_utc,
     get_data_dir,
     load_locations_config,
@@ -70,17 +70,19 @@ def write_bronze_record(
     return output_path.stat().st_size
 
 
-def _covers_partition(raw_response: dict, partition_date: date, tz_name: str) -> bool:
+def _covers_partition(raw_response: dict, partition_date: date) -> bool:
     """Return True if the response has data for the partition day.
 
     Requested sections are checked separately: some hourly value within the
-    UTC day, and some daily value for the local date equal to the partition.
+    UTC day, and some daily value for the local date equal to the partition
+    (dated with the response's fixed utc_offset_seconds, like Silver).
     The archive API lags behind real time and returns null-filled arrays for
     days it does not have yet, rather than an error.
     """
+    utc_offset = raw_response.get("utc_offset_seconds", 0)
     checks = {
         "hourly": lambda t: epoch_to_utc(t).date() == partition_date,
-        "daily": lambda t: epoch_to_local_date(t, tz_name) == partition_date,
+        "daily": lambda t: daily_epoch_to_date(t, utc_offset) == partition_date,
     }
     for section, in_partition in checks.items():
         data = raw_response.get(section)
@@ -143,7 +145,7 @@ def _fetch_location(
     )
     try:
         raw_response = client.fetch("archive", window)
-        if _covers_partition(raw_response, partition_date, location.timezone):
+        if _covers_partition(raw_response, partition_date):
             return raw_response, "archive"
         context.log.warning(
             f"Archive API has no data yet for {location.name} on {partition_date}, "

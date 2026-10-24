@@ -314,7 +314,7 @@ print(duckdb.sql(\"\"\"
 **Reading timestamps:**
 - `timestamp_utc` / `observed_at_utc` are UTC; `timestamp_local` / `observed_at_local` are in the city's timezone.
 - For half-hour-offset cities like Adelaide (UTC+10:30), hourly values fall at `:30` UTC, which is the top of the hour locally.
-- Daily rows (`date_local`) cover the city's own calendar day.
+- Daily rows (`date_local`) cover the city's own calendar day. Open-Meteo computes them with the UTC offset in effect when the data was requested, so for days across a daylight-saving change the day's window is shifted by an hour.
 
 ## 8. Troubleshooting
 

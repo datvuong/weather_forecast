@@ -144,7 +144,7 @@ No code changes are needed: Bronze requests it, and Silver adds it as a column w
 
 ### Request strategy
 - `OpenMeteoClient.fetch(endpoint, OpenMeteoRequest)` is variable-agnostic: sections, window and params come from the request.
-- Bronze requests each location's **own timezone** with `timeformat=unixtime`. Hourly `time` values are exact UTC epochs, and daily rows are stamped with the epoch of local midnight.
+- Bronze requests each location's **own timezone** with `timeformat=unixtime`. Hourly `time` values are exact UTC epochs. Daily rows are stamped with local midnight **under the response's single fixed offset** (`utc_offset_seconds` = the offset at request time), even for dates across a DST change. Date them with `daily_epoch_to_date(epoch, utc_offset_seconds)`, never with zoneinfo. For such dates the API's daily aggregation window is also shifted by the DST hour.
 - UTC partition `d` spans local dates `d-1..d+1`, so that window is requested (today: `past_days=1` + forecast days).
 - Only transport errors, 429 and 5xx are retried. Other 4xx raise `OpenMeteoAPIError` with Open-Meteo's `reason`.
 
@@ -177,7 +177,7 @@ No code changes are needed: Bronze requests it, and Silver adds it as a column w
 ## Conventions
 
 - All timestamps stored in **UTC** (with a separate `timestamp_local` column)
-- Partitions are **UTC calendar days**. The API is queried in each location's timezone with `timeformat=unixtime`: hourly rows are kept by UTC date, daily rows by local date (DST-safe via `zoneinfo`). Use `utc_today()`, never `date.today()`
+- Partitions are **UTC calendar days**. The API is queried in each location's timezone with `timeformat=unixtime`. Hourly rows are kept by UTC date, with `timestamp_local` from zoneinfo (DST-correct). Daily rows are kept by the date from `daily_epoch_to_date()` (fixed response offset, as Open-Meteo documents). Use `utc_today()`, never `date.today()`
 - Don't add `from __future__ import annotations` to asset modules: Dagster rejects the stringified `context: AssetExecutionContext` hint
 - Parquet files use **snappy** compression
 - DuckDB Gold tables use **upsert** semantics (idempotent re-runs); `gold_current_conditions` is replaced on each run

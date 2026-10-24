@@ -43,7 +43,7 @@ from weather_forecast.models.weather import (
 from weather_forecast.partitions import daily_partitions
 from weather_forecast.resources.api_client import unsupported_variables
 from weather_forecast.utils.helpers import (
-    epoch_to_local_date,
+    daily_epoch_to_date,
     epoch_to_utc,
     get_data_dir,
     load_locations_config,
@@ -92,9 +92,20 @@ def time_variables(
 
 
 def _section_keys(
-    section: Section, epoch: int, tz: ZoneInfo, partition_date: date, data: dict, index: int
+    section: Section,
+    epoch: int,
+    tz: ZoneInfo,
+    utc_offset_seconds: int,
+    partition_date: date,
+    data: dict,
+    index: int,
 ) -> dict[str, Any] | None:
-    """Return the key columns of one row, or None if it's outside the partition."""
+    """Return the key columns of one row, or None if it's outside the partition.
+
+    Hourly and current times are true UTC instants, so local time comes from
+    the location's timezone (DST-correct). Daily rows are dated with the
+    response's fixed offset, matching how Open-Meteo stamps them.
+    """
     if section == "hourly":
         ts_utc = epoch_to_utc(epoch)
         if ts_utc.date() != partition_date:
@@ -104,7 +115,7 @@ def _section_keys(
             "timestamp_local": ts_utc.astimezone(tz).replace(tzinfo=None),
         }
     if section == "daily":
-        local_date = epoch_to_local_date(epoch, tz.key)
+        local_date = daily_epoch_to_date(epoch, utc_offset_seconds)
         if local_date != partition_date:
             return None
         return {"date_local": local_date}
@@ -130,9 +141,10 @@ def parse_section(
 ) -> list[dict[str, Any]]:
     """Parse one section of an Open-Meteo response into flat records.
 
-    Bronze requests unixtime timestamps, so times are exact UTC epochs:
-    hourly rows are kept if their UTC date is the partition date, daily rows
-    if their local date is, and current snapshots if observed (UTC) that day.
+    Bronze requests unixtime timestamps: hourly rows are kept if their UTC
+    date is the partition date, daily rows if their date (local midnight
+    under the response's fixed utc_offset_seconds) is, and current snapshots
+    if observed (UTC) that day.
 
     Args:
         raw_json: Parsed API response JSON.
@@ -158,10 +170,11 @@ def parse_section(
     if time_format != "unixtime":
         raise ValueError(f"Expected unixtime {section} timestamps from API, got {time_format!r}")
     tz = ZoneInfo(location.timezone)
+    utc_offset = raw_json.get("utc_offset_seconds", 0)
 
     records = []
     for i, epoch in enumerate(timestamps):
-        keys = _section_keys(section, epoch, tz, partition_date, data, i)
+        keys = _section_keys(section, epoch, tz, utc_offset, partition_date, data, i)
         if keys is None:
             continue
 

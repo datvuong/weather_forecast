@@ -109,6 +109,41 @@ class TestParseSection:
 
         assert record["date_local"] == date(2026, 10, 4)
 
+    def test_daily_dated_with_response_offset_real_capture(self):
+        # Real archive response (#24): Melbourne 2026-09-24..26 requested in AEDT, so the
+        # whole response uses +11:00 although September is AEST (+10:00)
+        raw = {
+            "utc_offset_seconds": 39600,
+            "daily_units": {"time": "unixtime", "temperature_2m_max": "°C"},
+            "daily": {
+                "time": [1790168400, 1790254800, 1790341200],
+                "temperature_2m_max": [25.5, 23.2, 14.7],
+            },
+        }
+
+        [record] = _parse(raw, "daily", ["temperature_2m_max"], day=date(2026, 9, 25))
+
+        assert record["date_local"] == date(2026, 9, 25)
+        assert record["temperature_2m_max"] == 23.2
+
+    @pytest.mark.parametrize(
+        "start,request_offset",
+        [
+            (date(2026, 9, 28), 37800),  # requested after DST start (ACDT) for days before it
+            (date(2027, 4, 1), 37800),  # requested before DST end (ACDT) for days after it
+        ],
+    )
+    def test_daily_labels_correct_across_dst_change(self, start, request_offset):
+        raw = make_api_response(
+            start, days=10, daily_variables=DAILY, utc_offset_seconds=request_offset
+        )
+
+        for d in range(10):
+            day = start + timedelta(days=d)
+            [record] = _parse(raw, "daily", DAILY, {"sunrise"}, day=day)
+            assert record["date_local"] == day
+            assert record["temperature_2m_max"] == 15.0 + 11.5 + d
+
     def test_empty_response(self):
         assert _parse({"hourly": {}}) == []
         assert _parse({}, "daily", DAILY) == []

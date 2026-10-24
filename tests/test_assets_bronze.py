@@ -130,28 +130,41 @@ def test_unsupported_variables_reported_in_metadata(data_dir, locations, past_da
 class TestCoversPartition:
     day = date(2026, 10, 21)
 
+    def test_daily_dated_with_response_offset_across_dst(self):
+        # Real archive response for Melbourne 2026-09-24..26, requested in AEDT (+11:00):
+        # daily rows are stamped at +11:00 midnight although September is AEST (+10:00)
+        response = {
+            "utc_offset_seconds": 39600,
+            "daily": {
+                "time": [1790168400, 1790254800, 1790341200],
+                "temperature_2m_max": [25.5, None, 14.7],
+            },
+        }
+        assert _covers_partition(response, date(2026, 9, 24))
+        assert not _covers_partition(response, date(2026, 9, 25))  # its own row is null
+
     def test_hourly_data_in_utc_day(self):
-        assert _covers_partition(make_api_response(self.day), self.day, "Australia/Adelaide")
+        assert _covers_partition(make_api_response(self.day), self.day)
 
     def test_hourly_data_only_outside_utc_day(self):
         response = make_api_response(self.day - timedelta(days=1))
-        assert not _covers_partition(response, self.day, "Australia/Adelaide")
+        assert not _covers_partition(response, self.day)
 
     def test_all_null_hourly_values(self):
         response = make_api_response(self.day)
         for key in response["hourly"]:
             if key != "time":
                 response["hourly"][key] = [None] * 24
-        assert not _covers_partition(response, self.day, "Australia/Adelaide")
+        assert not _covers_partition(response, self.day)
 
     def test_missing_daily_row_for_local_date(self):
         response = make_api_response(self.day, daily_variables=["temperature_2m_max"])
         response["daily"]["temperature_2m_max"] = [None]
-        assert not _covers_partition(response, self.day, "Australia/Adelaide")
+        assert not _covers_partition(response, self.day)
 
     def test_daily_row_for_local_date(self):
         response = make_api_response(self.day, daily_variables=["temperature_2m_max"])
-        assert _covers_partition(response, self.day, "Australia/Adelaide")
+        assert _covers_partition(response, self.day)
 
 
 def test_file_exists_check_passes(data_dir, past_date):
