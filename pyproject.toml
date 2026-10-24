@@ -46,3 +46,6 @@ select = ["E", "F", "I", "W"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = "test_*.py"
+
+[tool.coverage.run]
+source = ["weather_forecast"]

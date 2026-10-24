@@ -102,10 +102,25 @@ every layer:
 ## Testing
 
 ```bash
-pytest                    # Run all tests
-pytest --cov              # Run with coverage
+pytest                    # Run all tests (no network access needed)
+pytest --cov              # Run with coverage for the weather_forecast package
 ruff check .              # Lint
 ```
+
+| Test file | Covers |
+|---|---|
+| `tests/test_models.py` | Pydantic config/domain models, YAML config loaders |
+| `tests/test_api_client.py` | Open-Meteo request params, retries and timeouts (HTTP mocked with `respx`) |
+| `tests/test_assets_bronze.py` | Endpoint selection, archive→forecast fallback, Bronze Parquet, file check |
+| `tests/test_assets_silver.py` | JSON parsing, UTC/local timestamps, validation, dedup, quality check |
+| `tests/test_assets_gold.py` | Daily aggregations, DuckDB upsert idempotency, temperature check |
+| `tests/test_duckdb_resource.py` | DuckDB queries and writer-lock retries |
+| `tests/test_schedules.py` | Hourly schedule targets the UTC partition; Definitions load |
+
+Asset tests run through Dagster's `materialize()` with a fake API client. Shared fixtures live
+in `tests/conftest.py`. The `data_dir` fixture points the pipeline at a temp directory via the
+`WEATHER_FORECAST_DATA_DIR` environment variable, which you can also use to relocate the data
+lake outside tests.
 
 ## Documentation
 

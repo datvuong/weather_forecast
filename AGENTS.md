@@ -128,7 +128,8 @@ hourly_variables:
 ### Open-Meteo Archive Endpoint
 - URL: `https://archive-api.open-meteo.com/v1/archive`
 - Used for historical backfill (dates in the past)
-- `precipitation_probability` is NOT available in archive data (will be null)
+- `precipitation_probability` is NOT requested from the archive, and `uv_index` comes back null there; both are null in Silver for archive days
+- Lags real time: for days it doesn't have yet it returns HTTP 200 with null-filled arrays, so Bronze falls back to the forecast endpoint for that date
 
 ### Rate Limits (Free Tier)
 - 600 calls/minute
@@ -139,11 +140,15 @@ hourly_variables:
 - **Unit tests** mock HTTP responses and test each asset independently
 - **Pydantic models** tested with valid/invalid data
 - **Asset tests** use Dagster's `materialize()` test utility
-- **Fixtures** in `tests/conftest.py` provide sample API responses and temp directories
+- **Fixtures** in `tests/conftest.py` provide sample API responses, a fake API client and temp directories
+- The `data_dir` fixture sets `WEATHER_FORECAST_DATA_DIR`, which `get_data_dir()` honours; never write to the real `data/` in tests
+- Tests must not hit the network: mock HTTP with `respx` or pass `FakeOpenMeteoClient`
 
 ## Conventions
 
 - All timestamps stored in **UTC** (with a separate `timestamp_local` column)
+- Partitions are **UTC calendar days**; the API is queried with `timezone=GMT` and local time is derived from each location's IANA timezone in Silver. Use `utc_today()`, never `date.today()`
+- Don't add `from __future__ import annotations` to asset modules: Dagster rejects the stringified `context: AssetExecutionContext` hint
 - Parquet files use **snappy** compression
 - DuckDB Gold tables use **upsert** semantics (idempotent re-runs)
 - Config changes go in **YAML files**, not Python code
