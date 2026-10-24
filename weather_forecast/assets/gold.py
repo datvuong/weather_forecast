@@ -176,6 +176,35 @@ def _load_hourly(context: AssetExecutionContext) -> pd.DataFrame | None:
     return hourly
 
 
+def _clear_gold_partition(
+    context: AssetExecutionContext, duckdb_resource: DuckDBResource, table: str
+) -> None:
+    """Remove a partition's Gold rows and Parquet file when there's no input for it.
+
+    Without this, a re-run after its Silver input disappeared kept the previous
+    rows and file, and gold_temperature_check passed on the stale data (#39).
+    """
+    partition_date_str = context.partition_key
+    with duckdb_resource.get_connection() as conn:
+        tables = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
+        deleted = 0
+        if table in tables:
+            deleted = conn.execute(
+                f"DELETE FROM {table} WHERE date = ? RETURNING 1", [partition_date_str]
+            ).fetchall()
+            deleted = len(deleted)
+    path = gold_path(table.removeprefix("gold_"), partition_date_str)
+    removed_file = path.exists()
+    path.unlink(missing_ok=True)
+    context.log.warning(
+        f"{table}: no input for {partition_date_str}; cleared {deleted} stale rows"
+        + (" and the Parquet file" if removed_file else "")
+    )
+    context.add_output_metadata(
+        {"partition_date": partition_date_str, "rows": 0, "stale_rows_removed": deleted}
+    )
+
+
 def _write_gold(
     context: AssetExecutionContext,
     duckdb_resource: DuckDBResource,
@@ -248,6 +277,7 @@ def gold_daily_temperature(
     """
     hourly = _load_hourly(context)
     if hourly is None:
+        _clear_gold_partition(context, duckdb_resource, "gold_daily_temperature")
         return
     result_df = _aggregate(
         hourly,
@@ -267,7 +297,7 @@ def gold_daily_temperature(
         context.partition_key,
     )
     if result_df.empty:
-        context.log.warning(f"No temperature data for {context.partition_key}")
+        _clear_gold_partition(context, duckdb_resource, "gold_daily_temperature")
         return
     _write_gold(context, duckdb_resource, "gold_daily_temperature", TEMPERATURE_COLUMNS, result_df)
 
@@ -293,6 +323,7 @@ def gold_daily_precipitation(
     """
     hourly = _load_hourly(context)
     if hourly is None:
+        _clear_gold_partition(context, duckdb_resource, "gold_daily_precipitation")
         return
     result_df = _aggregate(
         hourly,
@@ -310,7 +341,7 @@ def gold_daily_precipitation(
         context.partition_key,
     )
     if result_df.empty:
-        context.log.warning(f"No precipitation data for {context.partition_key}")
+        _clear_gold_partition(context, duckdb_resource, "gold_daily_precipitation")
         return
     _write_gold(
         context, duckdb_resource, "gold_daily_precipitation", PRECIPITATION_COLUMNS, result_df

@@ -244,6 +244,54 @@ def test_gold_more_extreme_than_api_is_a_warning(
     assert "outside the API's daily range" in evaluation.description
 
 
+def test_rerun_reflects_changed_silver_values(
+    data_dir, duckdb_resource, locations, past_date, silver_df
+):
+    # Row counts alone can't tell a real upsert from one that keeps old values (#39)
+    pk = past_date.isoformat()
+    _materialize(pk, duckdb_resource)
+    before = duckdb_resource.query("SELECT location_id, temp_max_c FROM gold_daily_temperature")
+
+    for offset in (-1, 0, 1):
+        path = silver_path("hourly", (past_date + timedelta(days=offset)).isoformat())
+        df = pd.read_parquet(path)
+        df["temperature_2m"] += 5.0
+        df.to_parquet(path, index=False)
+    _materialize(pk, duckdb_resource)
+
+    after = duckdb_resource.query("SELECT location_id, temp_max_c FROM gold_daily_temperature")
+    merged = before.merge(after, on="location_id", suffixes=("_before", "_after"))
+    assert len(after) == len(locations)
+    assert (merged["temp_max_c_after"] - merged["temp_max_c_before"]).round(6).eq(5.0).all()
+    parquet = pd.read_parquet(data_dir / "gold" / "daily_temperature" / f"{pk}.parquet")
+    assert sorted(parquet["temp_max_c"]) == sorted(after["temp_max_c"])
+
+
+def test_rerun_without_input_clears_stale_rows(data_dir, duckdb_resource, locations, past_date):
+    pk, other = past_date.isoformat(), (past_date - timedelta(days=5)).isoformat()
+    _write_silver(data_dir, locations, past_date)
+    _write_silver(data_dir, locations, past_date - timedelta(days=5))
+    _materialize(pk, duckdb_resource)
+    _materialize(other, duckdb_resource)
+
+    # The partition's Silver input disappears; Gold must not keep the old answer (#39)
+    for offset in (-1, 0, 1):
+        silver_path("hourly", (past_date + timedelta(days=offset)).isoformat()).unlink()
+    result = _materialize(pk, duckdb_resource)
+
+    assert result.success
+    for table in ("gold_daily_temperature", "gold_daily_precipitation"):
+        dates = set(duckdb_resource.query(f"SELECT date FROM {table}")["date"])
+        assert dates == {other}  # stale rows gone, other partitions untouched
+        metric = table.removeprefix("gold_")
+        assert not (data_dir / "gold" / metric / f"{pk}.parquet").exists()
+        assert (data_dir / "gold" / metric / f"{other}.parquet").exists()
+    metadata = result.asset_materializations_for_node("gold_daily_temperature")[0].metadata
+    assert metadata["stale_rows_removed"].value == len(locations)
+    [evaluation] = result.get_asset_check_evaluations()
+    assert not evaluation.passed  # no longer passes on a stale file
+
+
 def test_rerun_is_idempotent(data_dir, duckdb_resource, locations, past_date, silver_df):
     pk = past_date.isoformat()
 
