@@ -111,6 +111,45 @@ def make_api_response(
     return response
 
 
+CURRENT_VALUES = {
+    "temperature_2m": 18.2,
+    "relative_humidity_2m": 86.0,
+    "apparent_temperature": 19.2,
+    "precipitation": 0.1,
+    "weather_code": 51,
+    "wind_speed_10m": 6.3,
+    "wind_direction_10m": 187,
+    "is_day": 0,
+}
+
+
+def make_current_response(
+    observed_at: datetime,
+    tz: str = "Australia/Adelaide",
+    unsupported: list[str] | tuple[str, ...] = (),
+    **values,
+) -> dict:
+    """Build an Open-Meteo-style `current` snapshot in unixtime format.
+
+    Values default to CURRENT_VALUES (one per configured current variable);
+    keyword arguments override them.
+    """
+    snapshot = {**CURRENT_VALUES, **values}
+    current = {"time": int(observed_at.timestamp()), "interval": 900}
+    units = {"time": "unixtime", "interval": "seconds"}
+    for var, value in snapshot.items():
+        current[var] = None if var in unsupported else value
+        units[var] = "undefined" if var in unsupported else "x"
+    return {
+        "latitude": -34.9,
+        "longitude": 138.6,
+        "utc_offset_seconds": int(ZoneInfo(tz).utcoffset(observed_at).total_seconds()),
+        "timezone": tz,
+        "current_units": units,
+        "current": current,
+    }
+
+
 class FakeOpenMeteoClient:
     """Stand-in for OpenMeteoClient that records requests and returns canned data."""
 
@@ -129,18 +168,17 @@ class FakeOpenMeteoClient:
         return self.forecast_response
 
 
-def write_bronze_file(
-    data_dir,
+def write_bronze_rows(
+    path,
     location_name: str,
     partition_date: str,
     responses: list[tuple[dict, datetime]],
     api_endpoint: str = "archive",
 ) -> None:
-    """Write a Bronze Parquet file with one row per (response, ingestion time)."""
+    """Write a Bronze Parquet file at `path` with one row per (response, ingestion time)."""
     import json
 
-    location_dir = data_dir / "bronze" / location_name
-    location_dir.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     table = pa.table(
         {
             "raw_json": [json.dumps(r) for r, _ in responses],
@@ -152,7 +190,19 @@ def write_bronze_file(
             "api_endpoint": [api_endpoint] * len(responses),
         }
     )
-    pq.write_table(table, str(location_dir / f"{partition_date}.parquet"))
+    pq.write_table(table, str(path))
+
+
+def write_bronze_file(
+    data_dir,
+    location_name: str,
+    partition_date: str,
+    responses: list[tuple[dict, datetime]],
+    api_endpoint: str = "archive",
+) -> None:
+    """Write an hourly/daily Bronze file (data/bronze/{location}/{date}.parquet)."""
+    path = data_dir / "bronze" / location_name / f"{partition_date}.parquet"
+    write_bronze_rows(path, location_name, partition_date, responses, api_endpoint)
 
 
 @pytest.fixture

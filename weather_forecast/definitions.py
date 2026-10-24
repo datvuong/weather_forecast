@@ -8,6 +8,13 @@ for the weather forecast pipeline. Dagster discovers this module via the
 import dagster as dg
 
 from weather_forecast.assets.bronze import bronze_file_exists_check, bronze_forecast
+from weather_forecast.assets.current import (
+    bronze_current,
+    gold_current_conditions,
+    gold_current_freshness_check,
+    silver_current_check,
+    silver_current_weather,
+)
 from weather_forecast.assets.gold import (
     gold_daily_precipitation,
     gold_daily_temperature,
@@ -21,8 +28,20 @@ from weather_forecast.assets.silver import (
 )
 from weather_forecast.resources.api_client import OpenMeteoClient
 from weather_forecast.resources.duckdb_resource import DuckDBResource
-from weather_forecast.schedules import hourly_weather_schedule, weather_pipeline_job
-from weather_forecast.utils.helpers import get_warehouse_dir
+from weather_forecast.schedules import (
+    current_weather_job,
+    current_weather_schedule,
+    hourly_weather_schedule,
+    weather_pipeline_job,
+)
+from weather_forecast.utils.helpers import (
+    get_warehouse_dir,
+    load_locations_config,
+    load_variables_config,
+    warn_if_over_api_budget,
+)
+
+warn_if_over_api_budget(len(load_locations_config()), load_variables_config())
 
 defs = dg.Definitions(
     assets=[
@@ -31,15 +50,20 @@ defs = dg.Definitions(
         silver_daily_weather,
         gold_daily_temperature,
         gold_daily_precipitation,
+        bronze_current,
+        silver_current_weather,
+        gold_current_conditions,
     ],
     asset_checks=[
         bronze_file_exists_check,
         silver_quality_check,
         silver_daily_check,
         gold_temperature_check,
+        silver_current_check,
+        gold_current_freshness_check,
     ],
-    jobs=[weather_pipeline_job],
-    schedules=[hourly_weather_schedule],
+    jobs=[weather_pipeline_job, current_weather_job],
+    schedules=[hourly_weather_schedule, current_weather_schedule],
     resources={
         "open_meteo_client": OpenMeteoClient(),
         "duckdb_resource": DuckDBResource(

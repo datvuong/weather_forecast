@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import date, datetime, timezone
 from functools import lru_cache
@@ -15,6 +16,12 @@ from weather_forecast.models.weather import (
     LocationsConfig,
     VariablesConfig,
 )
+
+logger = logging.getLogger(__name__)
+
+# Open-Meteo free tier
+API_DAILY_CALL_LIMIT = 10_000
+API_BUDGET_WARNING_RATIO = 0.8
 
 
 def _get_config_dir() -> Path:
@@ -136,3 +143,30 @@ def epoch_to_local_date(seconds: int | float, tz_name: str) -> date:
     local midnight, so this yields the local day the aggregate covers.
     """
     return datetime.fromtimestamp(seconds, tz=ZoneInfo(tz_name)).date()
+
+
+def api_calls_per_day(num_locations: int, config: VariablesConfig) -> int:
+    """Estimate scheduled Open-Meteo calls per day.
+
+    The hourly pipeline makes one call per location per hour; current weather
+    (if configured) one call per location per poll.
+    """
+    per_location = 24
+    if config.current_names:
+        per_location += 24 * 60 // config.settings.current_interval_minutes
+    return num_locations * per_location
+
+
+def warn_if_over_api_budget(num_locations: int, config: VariablesConfig) -> int:
+    """Log a warning when scheduled calls exceed 80% of the daily free-tier limit."""
+    calls = api_calls_per_day(num_locations, config)
+    if calls > API_DAILY_CALL_LIMIT * API_BUDGET_WARNING_RATIO:
+        logger.warning(
+            "Scheduled Open-Meteo usage is ~%d calls/day for %d locations, above %d%% of the "
+            "%d/day free-tier limit. Reduce locations or raise current_interval_minutes.",
+            calls,
+            num_locations,
+            int(API_BUDGET_WARNING_RATIO * 100),
+            API_DAILY_CALL_LIMIT,
+        )
+    return calls

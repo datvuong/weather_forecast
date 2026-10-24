@@ -16,6 +16,7 @@ location's timezone with unixtime timestamps (see _fetch_location).
 import json
 import logging
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -44,6 +45,29 @@ from weather_forecast.utils.helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def write_bronze_record(
+    output_path: Path,
+    raw_response: dict,
+    location: LocationConfig,
+    partition_date: str,
+    ingestion_ts: datetime,
+    api_endpoint: str,
+) -> int:
+    """Write one raw API response as a Bronze Parquet file; return its size in bytes."""
+    record = {
+        "raw_json": [json.dumps(raw_response)],
+        "location_name": [location.name],
+        "latitude": [location.latitude],
+        "longitude": [location.longitude],
+        "partition_date": [partition_date],
+        "ingestion_timestamp": [ingestion_ts],
+        "api_endpoint": [api_endpoint],
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table(record), str(output_path), compression="snappy")
+    return output_path.stat().st_size
 
 
 def _covers_partition(raw_response: dict, partition_date: date, tz_name: str) -> bool:
@@ -179,28 +203,10 @@ def bronze_forecast(
                 f"they will be null"
             )
 
-        # Build the Bronze record
-        raw_json_str = json.dumps(raw_response)
-
-        record = {
-            "raw_json": [raw_json_str],
-            "location_name": [location.name],
-            "latitude": [location.latitude],
-            "longitude": [location.longitude],
-            "partition_date": [partition_date_str],
-            "ingestion_timestamp": [ingestion_ts],
-            "api_endpoint": [api_endpoint],
-        }
-
-        # Write Parquet file
-        location_dir = bronze_dir / location.name
-        location_dir.mkdir(parents=True, exist_ok=True)
-        output_path = location_dir / f"{partition_date_str}.parquet"
-
-        table = pa.table(record)
-        pq.write_table(table, str(output_path), compression="snappy")
-
-        file_size = output_path.stat().st_size
+        output_path = bronze_dir / location.name / f"{partition_date_str}.parquet"
+        file_size = write_bronze_record(
+            output_path, raw_response, location, partition_date_str, ingestion_ts, api_endpoint
+        )
         total_bytes += file_size
         total_locations += 1
 
