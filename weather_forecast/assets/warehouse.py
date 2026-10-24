@@ -22,7 +22,6 @@ import logging
 import duckdb
 from dagster import AssetCheckResult, AssetExecutionContext, MetadataValue, asset, asset_check
 
-from weather_forecast.assets.current import gold_current_conditions, silver_current_weather
 from weather_forecast.assets.dimensions import dim_location, dim_weather_code
 from weather_forecast.assets.silver import silver_daily_weather, silver_hourly_weather
 from weather_forecast.resources.duckdb_resource import DuckDBResource
@@ -126,14 +125,11 @@ def build_views(conn: duckdb.DuckDBPyConnection) -> dict[str, str]:
 @asset(
     group_name="dimensions",
     compute_kind="duckdb",
-    deps=[
-        dim_location,
-        dim_weather_code,
-        silver_hourly_weather,
-        silver_daily_weather,
-        silver_current_weather,
-        gold_current_conditions,
-    ],
+    # Only assets of weather_pipeline_job: depending on the current-weather assets
+    # (which can't exist for past days) made every history backfill warn about
+    # "upstream data missing" (#34). v_current_conditions is still created
+    # whenever gold_current_conditions exists.
+    deps=[dim_location, dim_weather_code, silver_hourly_weather, silver_daily_weather],
     description="DuckDB views over Silver plus analytic views joined to the dimensions.",
 )
 def warehouse_views(context: AssetExecutionContext, duckdb_resource: DuckDBResource) -> None:

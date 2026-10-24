@@ -145,3 +145,23 @@ def test_pipeline_job_ends_with_dimensions_and_views():
 
 def test_dimensions_job():
     assert _job_assets("dimensions_job") == {"dim_location", "dim_weather_code", "warehouse_views"}
+
+
+@pytest.mark.parametrize("job_name", ["weather_pipeline_job", "dimensions_job"])
+def test_job_assets_have_no_upstreams_outside_the_job(job_name):
+    # An upstream outside the job makes Dagster's backfill dialog warn "Upstream data
+    # missing" for every partition where that upstream isn't materialized (#34)
+    graph = defs.resolve_asset_graph()
+    in_job = {dg.AssetKey.from_user_string(k) for k in _job_assets(job_name)}
+    outside = {
+        key.to_user_string(): sorted(
+            parent.to_user_string() for parent in graph.get(key).parent_keys - in_job
+        )
+        for key in in_job
+        if graph.get(key).parent_keys - in_job
+    }
+    if job_name == "dimensions_job":
+        # The dimensions read Bronze/Silver, which that job deliberately doesn't run
+        assert set(outside) <= {"dim_location", "warehouse_views"}
+    else:
+        assert outside == {}
