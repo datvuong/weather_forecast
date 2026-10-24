@@ -240,7 +240,7 @@ To load the last 30 days (`backfill_days`):
    - **Custom**: drag across the partition bar to pick a range.
 3. Optionally tick **Backfill only failed and missing partitions within selection** under **Options**. If the dialog asks how to **Launch as…**, choose **Multiple runs (One per selected partition)**.
 4. Click **Launch backfill**. Once several partitions are selected, the button changes from **Launch 1 run** to this.
-5. Follow progress under **Runs → Backfills**; click the backfill to see each partition. Dagster runs up to 10 partitions at a time, so 30 days take a few minutes.
+5. Follow progress under **Runs → Backfills**; click the backfill to see each partition. Dagster runs up to 4 partitions at a time (`max_concurrent_runs` in `dagster.yaml`) and queues the rest, so 30 days take a few minutes.
 
 Past days come from Open-Meteo's archive. The last day or two, which the archive doesn't have yet, come from the forecast API automatically. When the partitions are done, the backfill also rebuilds `dim_location`, `dim_weather_code` and the SQL views (once).
 

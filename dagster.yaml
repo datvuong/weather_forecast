@@ -9,5 +9,13 @@ run_launcher:
   module: dagster.core.launcher
   class: DefaultRunLauncher
 
+# At most 4 runs execute at once; backfills queue the rest. Each run is a single
+# process (in-process executor, see definitions.py), so this bounds memory: ten
+# concurrent multi-process runs overloaded a 7 GB machine and the code server
+# timed out (#37). Takes effect when `dagster dev` (re)starts.
+concurrency:
+  runs:
+    max_concurrent_runs: 4
+
 telemetry:
   enabled: false

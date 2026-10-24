@@ -56,6 +56,9 @@ validate_gold_requirements(load_variables_config())
 warn_if_over_api_budget(len(load_locations_config()), load_variables_config())
 
 defs = dg.Definitions(
+    # Steps take well under a second, so one process per run beats a process per
+    # step (~180 MB each): concurrent backfill runs otherwise exhausted memory (#37)
+    executor=dg.in_process_executor,
     assets=[
         bronze_forecast,
         silver_hourly_weather,

@@ -195,5 +195,7 @@ No code changes are needed: Bronze requests it, and Silver adds it as a column w
 - **Star schema:** every fact table carries `location_id` (plus `location_name` for readability). Join dimensions on `location_id` and `weather_code`; never copy dimension attributes into facts. Dimensions are unpartitioned and seeded from YAML in `config/`
 - `warehouse_views` generates view SQL from the columns that exist; add new analytic views there, and keep the row-count (fan-out) check passing
 - Never hard-code variable names outside Gold: Bronze/Silver read them from config
+- Jobs use the **in-process executor** (steps are sub-second; a process per step only costs memory), and `dagster.yaml` caps **4 concurrent runs**. Every Parquet write goes through `write_parquet()` (atomic temp-file + rename), because concurrent runs read each other's files
+- Assets in `weather_pipeline_job` must not depend on assets outside it (e.g. current weather), or every backfill warns "Upstream data missing"; a test enforces this
 - Config changes go in **YAML files**, not Python code
 - Weather variable nulls are **preserved** (e.g., UV index is null at night)

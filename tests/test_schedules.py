@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 import dagster as dg
 import pytest
+import yaml
 
 from weather_forecast.definitions import defs
 from weather_forecast.partitions import daily_partitions
@@ -16,6 +17,7 @@ from weather_forecast.schedules import (
 )
 from weather_forecast.utils.helpers import (
     api_calls_per_day,
+    get_project_root,
     load_variables_config,
     utc_today,
     warn_if_over_api_budget,
@@ -142,3 +144,16 @@ class TestApiBudget:
         with caplog.at_level(logging.WARNING):
             warn_if_over_api_budget(2, load_variables_config())
         assert caplog.text == ""
+
+
+@pytest.mark.parametrize(
+    "job_name", ["weather_pipeline_job", "current_weather_job", "dimensions_job"]
+)
+def test_jobs_run_in_a_single_process(job_name):
+    # One process per run instead of one per step keeps backfills within memory (#37)
+    assert defs.resolve_job_def(job_name).executor_def.name == "in_process"
+
+
+def test_instance_limits_concurrent_runs():
+    config = yaml.safe_load((get_project_root() / "dagster.yaml").read_text())
+    assert config["concurrency"]["runs"]["max_concurrent_runs"] == 4
